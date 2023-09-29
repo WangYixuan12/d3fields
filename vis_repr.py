@@ -78,10 +78,7 @@ obs = {
 pcd = aggr_point_cloud_from_data(colors[..., ::-1], depths, intrinsics, extrinsics, downsample=True, boundaries=boundaries)
 pcd.remove_statistical_outlier(nb_neighbors=5, std_ratio=0.2)
 
-fusion.update(obs)[[ 0.87490918 -0.24637599  0.41693261  0.63666708]
- [-0.44229374 -0.75717002  0.4806972   0.66457463]
- [ 0.19725663 -0.60497308 -0.77142556 -1.16125645]
- [ 0.         -0.         -0.          1.        ]]
+fusion.update(obs)
 fusion.text_queries_for_inst_mask_no_track(query_texts, query_thresholds)
 
 ### 3D vis
@@ -110,10 +107,7 @@ cam = trimesh.scene.Camera(resolution=(1920, 1043), fov=(60, 60))
 cam_matrix = np.array([[ 0.87490918, -0.24637599,  0.41693261,  0.63666708],
                        [-0.44229374, -0.75717002,  0.4806972,   0.66457463],
                        [ 0.19725663, -0.60497308, -0.77142556, -1.16125645],
-                       [ 0.        , -0.        , -0.        ,  1.        ]])[[ 0.87490918 -0.24637599  0.41693261  0.63666708]
- [-0.44229374 -0.75717002  0.4806972   0.66457463]
- [ 0.19725663 -0.60497308 -0.77142556 -1.16125645]
- [ 0.         -0.         -0.          1.        ]]
+                       [ 0.        , -0.        , -0.        ,  1.        ]])
 
 # create mask mesh
 mask_meshes = fusion.create_instance_mask_mesh(vertices, triangles, out)
