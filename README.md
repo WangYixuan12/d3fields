@@ -34,7 +34,7 @@ python scripts/install_pytorch3d.py
 
 # download pretrained models
 bash scripts/download_ckpts.sh
-bash scrots/download_data.sh
+bash scripts/download_data.sh
 ```
 
 ### Visualization
