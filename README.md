@@ -46,6 +46,7 @@ python vis_tracking.py # visualize the tracking
 ### Code Explanation
 `Fusion` is the core class of D<sup>3</sup>Fields. It contains the following key functions:
 - `update`: it takes in the observation and updates the internal states.
-- `text_queries_for_inst_mask_no_track`: it will query the instance mask according to the text query and thresholds.
+- `text_queries_for_inst_mask`: it will query the instance mask according to the text query and thresholds.
+- `text_queries_for_inst_mask_no_track`: it is similar to `text_queries_for_inst_mask`, but it will not invoke the underlying [XMem](https://github.com/hkchengrex/XMem) tracking module.
 - `eval`: it will evaluate associated features for arbitrary 3D points.
 - `batch_eval`: for a large batch of points, it will evaluate them batch by batch to avoid out-of-memory error.
