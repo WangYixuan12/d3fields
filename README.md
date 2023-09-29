@@ -10,8 +10,8 @@
 <a target="_blank" href="https://robopil.github.io/d3fields/">Zhuoran Li</a><sup>2, 3*</sup>,
 <a target="_blank" href="https://robo-alex.github.io/">Mingtong Zhang</a><sup>1</sup>,
 <a target="_blank" href="https://ece.illinois.edu/about/directory/faculty/krdc">Katherine Driggs-Campbell</a><sup>1</sup>,
-<a target="_blank" href="https://jiajunwu.com/">Jiajun Wu</a><sup>1</sup>,
-<a target="_blank" href="https://profiles.stanford.edu/fei-fei-li">Li Fei-Fei</a><sup>1</sup>,
+<a target="_blank" href="https://jiajunwu.com/">Jiajun Wu</a><sup>2</sup>,
+<a target="_blank" href="https://profiles.stanford.edu/fei-fei-li">Li Fei-Fei</a><sup>2</sup>,
 <a target="_blank" href="https://yunzhuli.github.io/">Yunzhu Li</a><sup>1, 2</sup>
             
 <sup>1</sup>University of Illinois Urbana-Champaign,
