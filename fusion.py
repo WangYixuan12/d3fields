@@ -845,7 +845,7 @@ class Fusion():
     def batch_eval(self, pts, return_names=['dino_feats', 'mask']):
         batch_pts = 60000
         outputs = {}
-        for i in range(0, pts.shape[0], batch_pts):
+        for i in tqdm(range(0, pts.shape[0], batch_pts)):
             st_idx = i
             ed_idx = min(i + batch_pts, pts.shape[0])
             out = self.eval(pts[st_idx:ed_idx], return_names=return_names)

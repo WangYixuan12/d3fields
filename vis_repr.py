@@ -78,14 +78,6 @@ obs = {
 pcd = aggr_point_cloud_from_data(colors[..., ::-1], depths, intrinsics, extrinsics, downsample=True, boundaries=boundaries)
 pcd.remove_statistical_outlier(nb_neighbors=5, std_ratio=0.2)
 
-visualizer = o3d.visualization.Visualizer()
-visualizer.create_window()
-visualizer.add_geometry(pcd)
-
-visualizer.poll_events()
-visualizer.update_renderer()
-visualizer.run()
-
 fusion.update(obs)
 fusion.text_queries_for_inst_mask_no_track(query_texts, query_thresholds)
 
@@ -96,14 +88,17 @@ device = 'cuda'
 init_grid, grid_shape = create_init_grid(boundaries, step)
 init_grid = init_grid.to(device=device, dtype=torch.float32)
 
+print('eval init grid')
 with torch.no_grad():
     out = fusion.batch_eval(init_grid, return_names=[])
 
 # extract mesh
+print('extract mesh')
 vertices, triangles = fusion.extract_mesh(init_grid, out, grid_shape)
 
 # eval mask and feature of vertices
 vertices_tensor = torch.from_numpy(vertices).to(device, dtype=torch.float32)
+print('eval mesh vertices')
 with torch.no_grad():
     out = fusion.batch_eval(vertices_tensor, return_names=['dino_feats', 'mask', 'color_tensor'])
 
