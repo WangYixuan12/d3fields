@@ -1,6 +1,7 @@
 import argparse
 import os
 import copy
+from typing import List
 
 import numpy as np
 import json
@@ -8,9 +9,10 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 
 # Grounding DINO
-import GroundingDINO.groundingdino.datasets.transforms as T
-from GroundingDINO.groundingdino.util import box_ops
-from GroundingDINO.groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
+import groundingdino.datasets.transforms as T
+from groundingdino.util.inference import Model as GroundingDINOModel
+from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
+from segment_anything import SamPredictor
 
 # segment anything
 import cv2
@@ -379,6 +381,65 @@ def grounded_instance_sam_np(image, text_prompt, dino_model, sam_model, box_thre
         aggr_mask[masks[obj_i]] = obj_i + 1
 
     return aggr_mask
+
+def enhance_class_name(class_names: List[str]) -> List[str]:
+    return [
+        f"all {class_name}s"
+        for class_name
+        in class_names
+    ]
+
+def segment(sam_predictor: SamPredictor, image: np.ndarray, xyxy: np.ndarray) -> np.ndarray:
+    sam_predictor.set_image(image)
+    result_masks = []
+    for box in xyxy:
+        masks, scores, logits = sam_predictor.predict(
+            box=box,
+            multimask_output=True
+        )
+        index = np.argmax(scores)
+        result_masks.append(masks[index])
+    return np.array(result_masks)
+
+def grounded_instance_sam_new_ver(image,
+                                  text_prompts,
+                                  dino_model : GroundingDINOModel,
+                                  sam_model : SamPredictor,
+                                  box_thresholds,
+                                  merge_all=False,
+                                  device="cuda"):
+    # :param image: [H, W, 3] BGR
+    assert len(image.shape) == 3
+    # cfg
+    text_threshold = 0.25
+    device = "cuda:0"
+
+    # detect objects
+    detections = dino_model.predict_with_classes(
+        image=image,
+        # classes=enhance_class_name(class_names=text_prompts),
+        classes=text_prompts,
+        box_threshold=box_thresholds[0],
+        text_threshold=text_threshold,
+    )
+    
+    # convert detections to masks
+    detections.mask = segment(
+        sam_predictor=sam_model,
+        image=cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+        xyxy=detections.xyxy
+    )
+    labels = ['background']
+    for query_i in detections.class_id.tolist():
+        labels.append(text_prompts[query_i])
+    
+    # add detections mask for background
+    bg_mask = ~np.bitwise_or.reduce(detections.mask, axis=0)
+    bg_conf = 1.0
+    detections.mask = np.concatenate([np.expand_dims(bg_mask, axis=0), detections.mask], axis=0)
+    detections.confidence = np.concatenate([np.array([bg_conf]), detections.confidence], axis=0)
+
+    return detections.mask, labels, detections.confidence
 
 def grounded_instance_sam_bacth_queries_np(image, text_prompts, dino_model, sam_model, box_thresholds, merge_all=False):
     # :param image: [H, W, 3] RGB

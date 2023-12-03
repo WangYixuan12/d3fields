@@ -84,7 +84,7 @@ def gen_dense_kypts(data_path, src_feat_info):
         }
         
         fusion.update(obs)
-        fusion.text_queries_for_inst_mask(query_texts, query_thresholds, use_sam=((t // time_skip) % 30 == 0))
+        fusion.text_queries_for_inst_mask(query_texts, query_thresholds, boundaries=boundaries)
         
         # initialize for tracking
         if t == 0:

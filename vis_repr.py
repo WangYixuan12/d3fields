@@ -79,7 +79,7 @@ pcd = aggr_point_cloud_from_data(colors[..., ::-1], depths, intrinsics, extrinsi
 pcd.remove_statistical_outlier(nb_neighbors=5, std_ratio=0.2)
 
 fusion.update(obs)
-fusion.text_queries_for_inst_mask_no_track(query_texts, query_thresholds)
+fusion.text_queries_for_inst_mask_no_track(query_texts, query_thresholds, boundaries=boundaries)
 
 ### 3D vis
 device = 'cuda'

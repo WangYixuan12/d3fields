@@ -311,7 +311,18 @@ def aggr_point_cloud(database, sel_time=None, downsample=True):
         aggr_geometry += pcd
     return aggr_geometry
 
-def aggr_point_cloud_from_data(colors, depths, Ks, poses, downsample=True, masks=None, boundaries=None):
+def voxel_downsample(pcd, voxel_size, pcd_color=None):
+    # :param pcd: [N,3] numpy array
+    # :param voxel_size: float
+    # :return: [M,3] numpy array
+    pcd = np2o3d(pcd, pcd_color)
+    pcd_down = pcd.voxel_down_sample(voxel_size)
+    if pcd_color is not None:
+        return np.asarray(pcd_down.points), np.asarray(pcd_down.colors)
+    else:
+        return np.asarray(pcd_down.points)
+
+def aggr_point_cloud_from_data(colors, depths, Ks, poses, downsample=True, masks=None, boundaries=None, out_o3d=True):
     # colors: [N, H, W, 3] numpy array in uint8
     # depths: [N, H, W] numpy array in meters
     # Ks: [N, 3, 3] numpy array
@@ -325,6 +336,7 @@ def aggr_point_cloud_from_data(colors, depths, Ks, poses, downsample=True, masks
     step = 1
     # visualize scaled COLMAP poses
     pcds = []
+    pcd_colors = []
     for i in range(start, end, step):
         depth = depths[i]
         color = colors[i]
@@ -368,15 +380,51 @@ def aggr_point_cloud_from_data(colors, depths, Ks, poses, downsample=True, masks
                             (trans_pcd[:, 2] > z_lower) &\
                                 (trans_pcd[:, 2] < z_upper)
             
-            pcd_o3d = np2o3d(trans_pcd[trans_pcd_mask], color[mask][trans_pcd_mask])
+            if out_o3d:
+                pcd_o3d = np2o3d(trans_pcd[trans_pcd_mask], color[mask][trans_pcd_mask])
+            else:
+                pcd_np = trans_pcd[trans_pcd_mask]
+                pcd_color = color[mask][trans_pcd_mask]
         else:
-            pcd_o3d = np2o3d(trans_pcd, color[mask])
+            if out_o3d:
+                pcd_o3d = np2o3d(trans_pcd, color[mask])
+            else:
+                pcd_np =  trans_pcd
+                pcd_color = color[mask]
         # downsample
-        if downsample:
-            radius = 0.01
-            pcd_o3d = pcd_o3d.voxel_down_sample(radius)
-        pcds.append(pcd_o3d)
-    aggr_pcd = o3d.geometry.PointCloud()
-    for pcd in pcds:
-        aggr_pcd += pcd
-    return aggr_pcd
+        if out_o3d:
+            if downsample:
+                radius = 0.01
+                pcd_o3d = pcd_o3d.voxel_down_sample(radius)
+            pcds.append(pcd_o3d)
+        else:
+            if downsample:
+                pcd_np, pcd_color = voxel_downsample(pcd_np, 0.01, pcd_color)
+            pcds.append(pcd_np)
+            pcd_colors.append(pcd_color)
+    if out_o3d:
+        aggr_pcd = o3d.geometry.PointCloud()
+        for pcd in pcds:
+            aggr_pcd += pcd
+        return aggr_pcd
+    else:
+        pcds = np.concatenate(pcds, axis=0)
+        pcd_colors = np.concatenate(pcd_colors, axis=0)
+        return pcds, pcd_colors
+
+def draw_pcd_with_spheres(pcd, sphere_np_ls):
+    # :param pcd: o3d.geometry.PointCloud
+    # :param sphere_np_ls: list of [N, 3] numpy array
+    sphere_list = []
+    color_list = [
+        [1.,0.,0.],
+        [0.,1.,0.],
+    ]
+    for np_idx, sphere_np in enumerate(sphere_np_ls):
+        for src_pt in sphere_np:
+            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
+            sphere.compute_vertex_normals()
+            sphere.paint_uniform_color(color_list[np_idx])
+            sphere.translate(src_pt)
+            sphere_list.append(sphere)
+    o3d.visualization.draw_geometries([pcd] + sphere_list)

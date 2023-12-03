@@ -1,5 +1,7 @@
 import os
 import sys
+sys.path.append('/home/yixuan/general_dp/diffusion_policy/d3fields_dev')
+import time
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
@@ -13,336 +15,19 @@ import matplotlib.pyplot as plt
 import cv2
 import mcubes
 import trimesh
-from torch import nn
-from torchvision import transforms
-import torch.nn.modules.utils as nn_utils
-import math
-import timm
-import types
-from pathlib import Path
-from typing import Union, List, Tuple
 from PIL import Image
-from scipy.spatial.transform import Rotation as R
+import open3d as o3d
 
-from GroundingDINO.groundingdino.models import build_model
-from GroundingDINO.groundingdino.util.slconfig import SLConfig
-from GroundingDINO.groundingdino.util.utils import clean_state_dict
+import groundingdino
+from groundingdino.util.inference import Model as GroundingDINOModel
 from segment_anything import build_sam, SamPredictor
 from XMem.model.network import XMem
 from XMem.inference.data.mask_mapper import MaskMapper
 from XMem.inference.inference_core import InferenceCore
 from XMem.dataset.range_transform import im_normalization
-from utils.grounded_sam import grounded_instance_sam_bacth_queries_np
+from utils.grounded_sam import grounded_instance_sam_new_ver
 from utils.draw_utils import draw_keypoints, aggr_point_cloud_from_data
-from utils.corr_utils import compute_similarity_tensor, compute_similarity_tensor_multi
-from utils.my_utils import  depth2fgpcd, fps_np, find_indices, depth2normal
-from network.dense_correspondence_network import DenseCorrespondenceNetwork
-torch.cuda.set_device(0)
-
-class ViTExtractor:
-    """ This class facilitates extraction of features, descriptors, and saliency maps from a ViT.
-
-    We use the following notation in the documentation of the module's methods:
-    B - batch size
-    h - number of heads. usually takes place of the channel dimension in pytorch's convention BxCxHxW
-    p - patch size of the ViT. either 8 or 16.
-    t - number of tokens. equals the number of patches + 1, e.g. HW / p**2 + 1. Where H and W are the height and width
-    of the input image.
-    d - the embedding dimension in the ViT.
-    """
-
-    def __init__(self, model_type: str = 'dino_vits8', stride: int = 4, model: nn.Module = None, device: str = 'cuda'):
-        """
-        :param model_type: A string specifying the type of model to extract from.
-                          [dino_vits8 | dino_vits16 | dino_vitb8 | dino_vitb16 | vit_small_patch8_224 |
-                          vit_small_patch16_224 | vit_base_patch8_224 | vit_base_patch16_224]
-        :param stride: stride of first convolution layer. small stride -> higher resolution.
-        :param model: Optional parameter. The nn.Module to extract from instead of creating a new one in ViTExtractor.
-                      should be compatible with model_type.
-        """
-        self.model_type = model_type
-        self.device = device
-        if model is not None:
-            self.model = model
-        else:
-            self.model = ViTExtractor.create_model(model_type)
-
-        self.model = ViTExtractor.patch_vit_resolution(self.model, stride=stride)
-        self.model.eval()
-        self.model.to(self.device)
-        self.p = self.model.patch_embed.patch_size
-        self.stride = self.model.patch_embed.proj.stride
-
-        self.mean = (0.485, 0.456, 0.406) if "dino" in self.model_type else (0.5, 0.5, 0.5)
-        self.std = (0.229, 0.224, 0.225) if "dino" in self.model_type else (0.5, 0.5, 0.5)
-
-        self._feats = []
-        self.hook_handlers = []
-        self.load_size = None
-        self.num_patches = None
-
-    @staticmethod
-    def create_model(model_type: str) -> nn.Module:
-        """
-        :param model_type: a string specifying which model to load. [dino_vits8 | dino_vits16 | dino_vitb8 |
-                           dino_vitb16 | vit_small_patch8_224 | vit_small_patch16_224 | vit_base_patch8_224 |
-                           vit_base_patch16_224]
-        :return: the model
-        """
-        if 'dino' in model_type:
-            model = torch.hub.load('facebookresearch/dino:main', model_type)
-        else:  # model from timm -- load weights from timm to dino model (enables working on arbitrary size images).
-            temp_model = timm.create_model(model_type, pretrained=True)
-            model_type_dict = {
-                'vit_small_patch16_224': 'dino_vits16',
-                'vit_small_patch8_224': 'dino_vits8',
-                'vit_base_patch16_224': 'dino_vitb16',
-                'vit_base_patch8_224': 'dino_vitb8'
-            }
-            model = torch.hub.load('facebookresearch/dino:main', model_type_dict[model_type])
-            temp_state_dict = temp_model.state_dict()
-            del temp_state_dict['head.weight']
-            del temp_state_dict['head.bias']
-            model.load_state_dict(temp_state_dict)
-        return model
-
-    @staticmethod
-    def _fix_pos_enc(patch_size: int, stride_hw: Tuple[int, int]):
-        """
-        Creates a method for position encoding interpolation.
-        :param patch_size: patch size of the model.
-        :param stride_hw: A tuple containing the new height and width stride respectively.
-        :return: the interpolation method
-        """
-        def interpolate_pos_encoding(self, x: torch.Tensor, w: int, h: int) -> torch.Tensor:
-            npatch = x.shape[1] - 1
-            N = self.pos_embed.shape[1] - 1
-            if npatch == N and w == h:
-                return self.pos_embed
-            class_pos_embed = self.pos_embed[:, 0]
-            patch_pos_embed = self.pos_embed[:, 1:]
-            dim = x.shape[-1]
-            # compute number of tokens taking stride into account
-            w0 = 1 + (w - patch_size) // stride_hw[1]
-            h0 = 1 + (h - patch_size) // stride_hw[0]
-            assert (w0 * h0 == npatch), f"""got wrong grid size for {h}x{w} with patch_size {patch_size} and 
-                                            stride {stride_hw} got {h0}x{w0}={h0 * w0} expecting {npatch}"""
-            # we add a small number to avoid floating point error in the interpolation
-            # see discussion at https://github.com/facebookresearch/dino/issues/8
-            w0, h0 = w0 + 0.1, h0 + 0.1
-            patch_pos_embed = nn.functional.interpolate(
-                patch_pos_embed.reshape(1, int(math.sqrt(N)), int(math.sqrt(N)), dim).permute(0, 3, 1, 2),
-                scale_factor=(w0 / math.sqrt(N), h0 / math.sqrt(N)),
-                mode='bicubic',
-                align_corners=False, recompute_scale_factor=False
-            )
-            assert int(w0) == patch_pos_embed.shape[-2] and int(h0) == patch_pos_embed.shape[-1]
-            patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-            return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
-
-        return interpolate_pos_encoding
-
-    @staticmethod
-    def patch_vit_resolution(model: nn.Module, stride: int) -> nn.Module:
-        """
-        change resolution of model output by changing the stride of the patch extraction.
-        :param model: the model to change resolution for.
-        :param stride: the new stride parameter.
-        :return: the adjusted model
-        """
-        patch_size = model.patch_embed.patch_size
-        if stride == patch_size:  # nothing to do
-            return model
-
-        stride = nn_utils._pair(stride)
-        assert all([(patch_size // s_) * s_ == patch_size for s_ in
-                    stride]), f'stride {stride} should divide patch_size {patch_size}'
-
-        # fix the stride
-        model.patch_embed.proj.stride = stride
-        # fix the positional encoding code
-        model.interpolate_pos_encoding = types.MethodType(ViTExtractor._fix_pos_enc(patch_size, stride), model)
-        return model
-
-    def preprocess(self, image_path: Union[str, Path],
-                   load_size: Union[int, Tuple[int, int]] = None) -> Tuple[torch.Tensor, Image.Image]:
-        """
-        Preprocesses an image before extraction.
-        :param image_path: path to image to be extracted.
-        :param load_size: optional. Size to resize image before the rest of preprocessing.
-        :return: a tuple containing:
-                    (1) the preprocessed image as a tensor to insert the model of shape BxCxHxW.
-                    (2) the pil image in relevant dimensions
-        """
-        pil_image = Image.open(image_path).convert('RGB')
-        if load_size is not None:
-            pil_image = transforms.Resize(load_size, interpolation=transforms.InterpolationMode.LANCZOS)(pil_image)
-        prep = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=self.mean, std=self.std)
-        ])
-        prep_img = prep(pil_image)[None, ...]
-        return prep_img, pil_image
-
-    def _get_hook(self, facet: str):
-        """
-        generate a hook method for a specific block and facet.
-        """
-        if facet in ['attn', 'token']:
-            def _hook(model, input, output):
-                self._feats.append(output)
-            return _hook
-
-        if facet == 'query':
-            facet_idx = 0
-        elif facet == 'key':
-            facet_idx = 1
-        elif facet == 'value':
-            facet_idx = 2
-        else:
-            raise TypeError(f"{facet} is not a supported facet.")
-
-        def _inner_hook(module, input, output):
-            input = input[0]
-            B, N, C = input.shape
-            qkv = module.qkv(input).reshape(B, N, 3, module.num_heads, C // module.num_heads).permute(2, 0, 3, 1, 4)
-            self._feats.append(qkv[facet_idx]) #Bxhxtxd
-        return _inner_hook
-
-    def _register_hooks(self, layers: List[int], facet: str) -> None:
-        """
-        register hook to extract features.
-        :param layers: layers from which to extract features.
-        :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn']
-        """
-        for block_idx, block in enumerate(self.model.blocks):
-            if block_idx in layers:
-                if facet == 'token':
-                    self.hook_handlers.append(block.register_forward_hook(self._get_hook(facet)))
-                elif facet == 'attn':
-                    self.hook_handlers.append(block.attn.attn_drop.register_forward_hook(self._get_hook(facet)))
-                elif facet in ['key', 'query', 'value']:
-                    self.hook_handlers.append(block.attn.register_forward_hook(self._get_hook(facet)))
-                else:
-                    raise TypeError(f"{facet} is not a supported facet.")
-
-    def _unregister_hooks(self) -> None:
-        """
-        unregisters the hooks. should be called after feature extraction.
-        """
-        for handle in self.hook_handlers:
-            handle.remove()
-        self.hook_handlers = []
-
-    def _extract_features(self, batch: torch.Tensor, layers: List[int] = 11, facet: str = 'key') -> List[torch.Tensor]:
-        """
-        extract features from the model
-        :param batch: batch to extract features for. Has shape BxCxHxW.
-        :param layers: layer to extract. A number between 0 to 11.
-        :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token' | 'attn']
-        :return : tensor of features.
-                  if facet is 'key' | 'query' | 'value' has shape Bxhxtxd
-                  if facet is 'attn' has shape Bxhxtxt
-                  if facet is 'token' has shape Bxtxd
-        """
-        B, C, H, W = batch.shape
-        self._feats = []
-        self._register_hooks(layers, facet)
-        _ = self.model(batch)
-        self._unregister_hooks()
-        self.load_size = (H, W)
-        self.num_patches = (1 + (H - self.p) // self.stride[0], 1 + (W - self.p) // self.stride[1])
-        return self._feats
-
-    def _log_bin(self, x: torch.Tensor, hierarchy: int = 2) -> torch.Tensor:
-        """
-        create a log-binned descriptor.
-        :param x: tensor of features. Has shape Bxhxtxd.
-        :param hierarchy: how many bin hierarchies to use.
-        """
-        B = x.shape[0]
-        num_bins = 1 + 8 * hierarchy
-
-        bin_x = x.permute(0, 2, 3, 1).flatten(start_dim=-2, end_dim=-1)  # Bx(t-1)x(dxh)
-        bin_x = bin_x.permute(0, 2, 1)
-        bin_x = bin_x.reshape(B, bin_x.shape[1], self.num_patches[0], self.num_patches[1])
-        # Bx(dxh)xnum_patches[0]xnum_patches[1]
-        sub_desc_dim = bin_x.shape[1]
-
-        avg_pools = []
-        # compute bins of all sizes for all spatial locations.
-        for k in range(0, hierarchy):
-            # avg pooling with kernel 3**kx3**k
-            win_size = 3 ** k
-            avg_pool = torch.nn.AvgPool2d(win_size, stride=1, padding=win_size // 2, count_include_pad=False)
-            avg_pools.append(avg_pool(bin_x))
-
-        bin_x = torch.zeros((B, sub_desc_dim * num_bins, self.num_patches[0], self.num_patches[1])).to(self.device)
-        for y in range(self.num_patches[0]):
-            for x in range(self.num_patches[1]):
-                part_idx = 0
-                # fill all bins for a spatial location (y, x)
-                for k in range(0, hierarchy):
-                    kernel_size = 3 ** k
-                    for i in range(y - kernel_size, y + kernel_size + 1, kernel_size):
-                        for j in range(x - kernel_size, x + kernel_size + 1, kernel_size):
-                            if i == y and j == x and k != 0:
-                                continue
-                            if 0 <= i < self.num_patches[0] and 0 <= j < self.num_patches[1]:
-                                bin_x[:, part_idx * sub_desc_dim: (part_idx + 1) * sub_desc_dim, y, x] = avg_pools[k][
-                                                                                                           :, :, i, j]
-                            else:  # handle padding in a more delicate way than zero padding
-                                temp_i = max(0, min(i, self.num_patches[0] - 1))
-                                temp_j = max(0, min(j, self.num_patches[1] - 1))
-                                bin_x[:, part_idx * sub_desc_dim: (part_idx + 1) * sub_desc_dim, y, x] = avg_pools[k][
-                                                                                                           :, :, temp_i,
-                                                                                                           temp_j]
-                            part_idx += 1
-        bin_x = bin_x.flatten(start_dim=-2, end_dim=-1).permute(0, 2, 1).unsqueeze(dim=1)
-        # Bx1x(t-1)x(dxh)
-        return bin_x
-
-    def extract_descriptors(self, batch: torch.Tensor, layer: int = 11, facet: str = 'key',
-                            bin: bool = False, include_cls: bool = False) -> torch.Tensor:
-        """
-        extract descriptors from the model
-        :param batch: batch to extract descriptors for. Has shape BxCxHxW.
-        :param layers: layer to extract. A number between 0 to 11.
-        :param facet: facet to extract. One of the following options: ['key' | 'query' | 'value' | 'token']
-        :param bin: apply log binning to the descriptor. default is False.
-        :return: tensor of descriptors. Bx1xtxd' where d' is the dimension of the descriptors.
-        """
-        assert facet in ['key', 'query', 'value', 'token'], f"""{facet} is not a supported facet for descriptors. 
-                                                             choose from ['key' | 'query' | 'value' | 'token'] """
-        self._extract_features(batch, [layer], facet)
-        x = self._feats[0]
-        if facet == 'token':
-            x.unsqueeze_(dim=1) #Bx1xtxd
-        if not include_cls:
-            x = x[:, :, 1:, :]  # remove cls token
-        else:
-            assert not bin, "bin = True and include_cls = True are not supported together, set one of them False."
-        if not bin:
-            desc = x.permute(0, 2, 3, 1).flatten(start_dim=-2, end_dim=-1).unsqueeze(dim=1)  # Bx1xtx(dxh)
-        else:
-            desc = self._log_bin(x)
-        return desc
-
-    def extract_saliency_maps(self, batch: torch.Tensor) -> torch.Tensor:
-        """
-        extract saliency maps. The saliency maps are extracted by averaging several attention heads from the last layer
-        in of the CLS token. All values are then normalized to range between 0 and 1.
-        :param batch: batch to extract saliency maps for. Has shape BxCxHxW.
-        :return: a tensor of saliency maps. has shape Bxt-1
-        """
-        assert self.model_type == "dino_vits8", f"saliency maps are supported only for dino_vits model_type."
-        self._extract_features(batch, [11], 'attn')
-        head_idxs = [0, 2, 4, 5]
-        curr_feats = self._feats[0] #Bxhxtxt
-        cls_attn_map = curr_feats[:, head_idxs, 0, 1:].mean(dim=1) #Bx(t-1)
-        temp_mins, temp_maxs = cls_attn_map.min(dim=1)[0], cls_attn_map.max(dim=1)[0]
-        cls_attn_maps = (cls_attn_map - temp_mins) / (temp_maxs - temp_mins)  # normalize to range [0,1]
-        return cls_attn_maps
+from utils.my_utils import  depth2fgpcd, fps_np
 
 def project_points_coords(pts, Rt, K):
     """
@@ -355,10 +40,10 @@ def project_points_coords(pts, Rt, K):
         depth:          [rfn,pn,1]
     """
     pn = pts.shape[0]
-    hpts = torch.cat([pts,torch.ones([pn,1],device=pts.device,dtype=torch.float32)],1)
+    hpts = torch.cat([pts,torch.ones([pn,1],device=pts.device,dtype=pts.dtype)],1)
     srn = Rt.shape[0]
     KRt = K @ Rt # rfn,3,4
-    last_row = torch.zeros([srn,1,4],device=pts.device,dtype=torch.float32)
+    last_row = torch.zeros([srn,1,4],device=pts.device,dtype=pts.dtype)
     last_row[:,:,3] = 1.0
     H = torch.cat([KRt,last_row],1) # rfn,4,4
     pts_cam = H[:,None,:,:] @ hpts[None,:,:,None]
@@ -402,156 +87,6 @@ def create_init_grid(boundaries, step_size):
     coords = torch.stack([xx, yy, zz], dim=-1).reshape(-1, 3)
     return coords, xx.shape
 
-
-def load_model(model_config_path, model_checkpoint_path, device):
-    args = SLConfig.fromfile(model_config_path)
-    args.device = device
-    model = build_model(args)
-    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
-    load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
-    print(load_res)
-    _ = model.eval()
-    return model
-
-def vis_tracking_pts(database, match_pts, sel_time):
-    img_id = database.get_img_ids()[2]
-    
-    img = database.get_image(img_id, sel_time)[..., ::-1]
-    
-    color_cands = [(31,119,180), # in BGR
-                (255,127,14),
-                (44,160,44),
-                (214,39,40),
-                (148,103,189),]
-    
-    N = match_pts.shape[0]
-    colors = color_cands[:N]
-    
-    Ks = database.get_K(img_id)
-    pose = database.get_pose(img_id)
-    
-    fx = Ks[0, 0]
-    fy = Ks[1, 1]
-    cx = Ks[0, 2]
-    cy = Ks[1, 2]
-    
-    match_pts = np.concatenate([match_pts, np.ones([N, 1])], axis=-1) # [N, 4]
-    match_pts = np.matmul(pose, match_pts.T)[:3].T # [N, 3]
-    
-    match_pts_2d = match_pts[:, :2] / match_pts[:, 2:] # [N, 2]
-    match_pts_2d[:, 0] = match_pts_2d[:, 0] * fx + cx
-    match_pts_2d[:, 1] = match_pts_2d[:, 1] * fy + cy
-    
-    match_pts_2d = match_pts_2d.astype(np.int32)
-    img = draw_keypoints(img, match_pts_2d, colors, radius=5)
-    
-    return img
-
-def vis_tracking_multimodal_pts(database, match_pts_list, conf_list, sel_time, mask, view_idx = 0):
-    # :param match_pts_list: list of [num_pts, 3]
-    # :mask: [num_view, H, W, NQ] numpy array
-    img_id = database.get_img_ids()[view_idx]
-    
-    img = database.get_image(img_id, sel_time)[..., ::-1]
-    
-    color_cands = [(31,119,180), # in BGR
-                (255,127,14),
-                (44,160,44),
-                (214,39,40),
-                (148,103,189),]
-    
-    Ks = database.get_K(img_id)
-    pose = database.get_pose(img_id)
-    
-    fx = Ks[0, 0]
-    fy = Ks[1, 1]
-    cx = Ks[0, 2]
-    cy = Ks[1, 2]
-    
-    for i, match_pts in enumerate(match_pts_list):
-        # topk = min(5,match_pts.shape[0])
-        # conf = conf_list[i]
-        # topk_conf_idx = np.argpartition(conf, -topk)[-topk:]
-        num_pts = match_pts.shape[0]
-        # colors = color_cands[:num_pts]
-        cmap = cm.get_cmap('viridis')
-        colors = (cmap(np.linspace(0, 1, num_pts))[:, :3] * 255).astype(np.int32)[::-1, ::-1]
-        match_pts = np.concatenate([match_pts, np.ones([num_pts, 1])], axis=-1) # [num_pts, 4]
-        match_pts = np.matmul(pose, match_pts.T)[:3].T # [num_pts, 3]
-        
-        match_pts_2d = match_pts[:, :2] / match_pts[:, 2:] # [num_pts, 2]
-        match_pts_2d[:, 0] = match_pts_2d[:, 0] * fx + cx
-        match_pts_2d[:, 1] = match_pts_2d[:, 1] * fy + cy
-        
-        match_pts_2d = match_pts_2d.astype(np.int32)
-        match_pts_2d = match_pts_2d.reshape(num_pts, 2)
-        # img = draw_keypoints(img, match_pts_2d[topk_conf_idx], colors[topk_conf_idx], radius=5)
-        img = draw_keypoints(img, match_pts_2d, colors, radius=5)
-    
-    # visualize the mask
-    # mask = onehot2instance(mask) # [num_view, H, W]
-    # mask = mask / mask.max() # [num_view, H, W]
-    # num_view, H, W = mask.shape
-    # cmap = cm.get_cmap('jet')
-    # mask_vis = cmap(mask.reshape(-1)).reshape(num_view, H, W, 4)[..., :3] # [num_view, H, W, 3]
-    # mask_vis = (mask_vis * 255).astype(np.uint8)
-    # mask_vis = mask_vis[view_idx]
-    
-    # img = cv2.addWeighted(img, 0.5, mask_vis, 0.5, 0)
-    
-    return img
-
-def octree_subsample(sim_vol, que_pts, last_res, topK):
-    # :param sim_vol: [nd, N] # larger means more similar
-    # :param que_pts: [nd, 3]
-    # :param last_res: float
-    # :param topK: float
-    # :return child_que_pts = que_pts[alpha_mask] # [n_pts * 8, 3]
-    assert sim_vol.shape[0] == que_pts.shape[0]
-    sim_vol_topk, sim_vol_topk_idx = torch.topk(sim_vol, topK, dim=0, largest=True, sorted=False) # [topK, N]
-    sim_vol_topk_idx = sim_vol_topk_idx.reshape(-1) # [topK*N]
-    sim_vol_topk_idx = torch.unique(sim_vol_topk_idx) # [n_pts], n_pts <= topK*N
-    sel_que_pts = que_pts[sim_vol_topk_idx] # [n_pts, 3]
-    curr_res = last_res / 2
-    
-    child_offsets = torch.tensor([[curr_res, curr_res, curr_res],
-                                  [curr_res, curr_res, -curr_res],
-                                  [curr_res, -curr_res, curr_res],
-                                  [curr_res, -curr_res, -curr_res],
-                                  [-curr_res, curr_res, curr_res],
-                                  [-curr_res, curr_res, -curr_res],
-                                  [-curr_res, -curr_res, curr_res],
-                                  [-curr_res, -curr_res, -curr_res]], dtype=torch.float32, device=que_pts.device) # [8, 3]
-    child_que_pts = [sel_que_pts + child_offsets[i] for i in range(8)] # [n_pts * 8, 3]
-    child_que_pts = torch.cat(child_que_pts, dim=0) # [n_pts * 8, 3]
-    return child_que_pts, curr_res
-
-def extract_kypts_gpu(sim_vol, que_pts, match_metric='sum'):
-    # :param sim_vol: [n_pts, N] numpy array
-    # :param que_pts: [n_pts, 3] numpy array
-    # :return: [N, 3] numpy array
-    N = sim_vol.shape[1]
-    if type(sim_vol) is not torch.Tensor:
-        sim_vol_tensor = torch.from_numpy(sim_vol).to("cuda:0") # [n_pts, N]
-        que_pts_tensor = torch.from_numpy(que_pts).to("cuda:0") # [n_pts, 3]
-    else:
-        sim_vol_tensor = sim_vol
-        que_pts_tensor = que_pts
-    if match_metric == 'max':
-        raise NotImplementedError
-    elif match_metric == 'sum':
-        # scale = 0.05
-        # sim_vol_tensor = torch.exp(-sim_vol_tensor*scale)
-        # match_pts_tensor = torch.zeros([N, 3]).cuda() # [N, 3]
-        # for j in range(N):
-        #     match_pts_tensor[j] = torch.sum(que_pts_tensor * sim_vol_tensor[:, j].unsqueeze(-1), dim=0) / torch.sum(sim_vol_tensor[:, j])
-        
-        # vectorized version
-        match_pts_tensor = torch.sum(que_pts_tensor.unsqueeze(1) * sim_vol_tensor.unsqueeze(-1), dim=0) / torch.sum(sim_vol_tensor, dim=0).unsqueeze(-1) # [N, 3]
-        # conf = sim_vol_tensor / torch.sum(sim_vol_tensor, dim=0).unsqueeze(0) # [n_pts, N]
-        # conf = conf.max(dim=0)[0] # [N]
-    return match_pts_tensor # , conf
-
 def instance2onehot(instance, N = None):
     # :param instance: [**dim] numpy array uint8, val from 0 to N-1
     # :return: [**dim, N] numpy array bool
@@ -559,11 +94,9 @@ def instance2onehot(instance, N = None):
         N = instance.max() + 1
     if type(instance) is np.ndarray:
         assert instance.dtype == np.uint8
-        # assert instance.min() == 0
-        H, W = instance.shape
         out = np.zeros(instance.shape + (N,), dtype=bool)
         for i in range(N):
-            out[:, :, i] = (instance == i)
+            out[..., i] = (instance == i)
     elif type(instance) is torch.Tensor:
         assert instance.dtype == torch.uint8
         # assert instance.min() == 0
@@ -582,9 +115,94 @@ def onehot2instance(one_hot_mask):
     else:
         raise NotImplementedError
 
+def _init_low_level_memory(lower_bound, higher_bound, voxel_size, voxel_num):
+    def pcd_to_voxel(pcds):
+        if type(pcds) == list:
+            pcds = np.array(pcds)
+        # The pc is in numpy array with shape (..., 3)
+        # The voxel is in numpy array with shape (..., 3)
+        voxels = np.floor((pcds - lower_bound) / voxel_size).astype(np.int32)
+        return voxels
+
+    def voxel_to_pcd(voxels):
+        if type(voxels) == list:
+            voxels = np.array(voxels)
+        # The voxel is in numpy array with shape (..., 3)
+        # The pc is in numpy array with shape (..., 3)
+        pcds = voxels * voxel_size + lower_bound
+        return pcds
+
+    def voxel_to_index(voxels):
+        if type(voxels) == list:
+            voxels = np.array(voxels)
+        # The voxel is in numpy array with shape (..., 3)
+        # The index is in numpy array with shape (...,)
+        indexes = (
+            voxels[..., 0] * voxel_num[1] * voxel_num[2]
+            + voxels[..., 1] * voxel_num[2]
+            + voxels[..., 2]
+        )
+        return indexes
+
+    def index_to_voxel(indexes):
+        if type(indexes) == list:
+            indexes = np.array(indexes)
+        # The index is in numpy array with shape (...,)
+        # The voxel is in numpy array with shape (..., 3)
+        voxels = np.zeros((indexes.shape + (3,)), dtype=np.int32)
+        voxels[..., 2] = indexes % voxel_num[2]
+        indexes = indexes // voxel_num[2]
+        voxels[..., 1] = indexes % voxel_num[1]
+        voxels[..., 0] = indexes // voxel_num[1]
+        return voxels
+
+    def pcd_to_index(pcds):
+        # The pc is in numpy array with shape (..., 3)
+        # The index is in numpy array with shape (...,)
+        voxels = pcd_to_voxel(pcds)
+        indexes = voxel_to_index(voxels)
+        return indexes
+
+    def index_to_pcd(indexes):
+        # The index is in numpy array with shape (...,)
+        # The pc is in numpy array with shape (..., 3)
+        voxels = index_to_voxel(indexes)
+        pcds = voxel_to_pcd(voxels)
+        return pcds
+
+    return (
+        pcd_to_voxel,
+        voxel_to_pcd,
+        voxel_to_index,
+        index_to_voxel,
+        pcd_to_index,
+        index_to_pcd,
+    )
+
+def rm_mask_close_to_pcd(depth, mask, pcd, K, pose):
+    # remove the mask that is close to the pcd
+    # the mask is in the camera frame with intrinsics K and pose
+    # the pcd is in the world frame
+    # :param depth: (H, W) numpy array float32
+    # :param mask: (H, W) numpy array bool
+    # :param pcd: (N, 3) numpy array float32
+    # :param K: (3, 3) numpy array float32
+    # :param pose: (4, 4) numpy array float32, that transforms points from world frame to camera frame
+    # :return: (H, W) numpy array bool
+    cam_params = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
+    pcd_in_cam = depth2fgpcd(depth=depth, mask=mask, cam_params=cam_params, preserve_zero=True)
+    pcd_in_world = np.linalg.inv(pose) @ np.concatenate([pcd_in_cam, np.ones([pcd_in_cam.shape[0], 1])], axis=-1).T # [4, N]
+    pcd_in_world = pcd_in_world[:3].T # [N, 3]
+    close_mask = np.linalg.norm(pcd_in_world[:, None, :] - pcd[None, ...], axis=-1).min(axis=-1) < 0.02
+    mask_idx = np.where(mask)
+    filter_mask_idx = (mask_idx[0][close_mask], mask_idx[1][close_mask])
+    mask[filter_mask_idx] = False
+    return mask
+
 class Fusion():
-    def __init__(self, num_cam, feat_backbone='dinov2'):
-        self.device = 'cuda:0'
+    def __init__(self, num_cam, feat_backbone='dinov2', device='cuda:0', dtype=torch.float32):
+        self.device = device
+        self.dtype = dtype
         
         # hyper-parameters
         self.mu = 0.02
@@ -603,29 +221,47 @@ class Fusion():
         self.feat_backbone = feat_backbone
         if self.feat_backbone == 'dinov2':
             self.dinov2_feat_extractor = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device)
-        elif self.feat_backbone == 'dino':
-            self.dinov2_feat_extractor = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device)
-            self.feat_extractor = ViTExtractor(model_type='dino_vitb8', stride=8, device=self.device)
-        elif self.feat_backbone == 'don':
-            model_folder = os.path.join(os.getcwd(),'ckpts','don')
-            self.dinov2_feat_extractor = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14').to(self.device)
-            self.feat_extractor = DenseCorrespondenceNetwork.from_model_folder(model_folder, model_param_file=os.path.join(model_folder,'003501.pth'))
-            self.feat_extractor.eval()
+        else:
+            raise NotImplementedError
+        self.dinov2_feat_extractor.eval()
+        self.dinov2_feat_extractor.to(dtype=self.dtype)
         
         # load GroundedSAM model
-        # config_file = 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'  # change the path of the model config file
-        config_file = 'GroundingDINO/groundingdino/config/GroundingDINO_SwinB.cfg.py'
-        # grounded_checkpoint = 'ckpts/groundingdino_swint_ogc.pth'  # change the path of the model
-        grounded_checkpoint = 'ckpts/groundingdino_swinb_cogcoor.pth'
-        sam_checkpoint = 'ckpts/sam_vit_h_4b8939.pth'
-        self.ground_dino_model = load_model(config_file, grounded_checkpoint, device=self.device)
+        curr_path = os.path.dirname(os.path.abspath(__file__))
+        config_file = os.path.join(groundingdino.__path__[0], 'config/GroundingDINO_SwinT_OGC.py')
+        grounded_checkpoint = os.path.join(curr_path, 'ckpts/groundingdino_swint_ogc.pth')
+        # config_file = os.path.join(curr_path, '../gdino_config/GroundingDINO_SwinB.cfg.py')
+        # grounded_checkpoint = os.path.join(curr_path, 'ckpts/groundingdino_swinb_cogcoor.pth')
+        if not os.path.exists(grounded_checkpoint):
+            print('Downloading GroundedSAM model...')
+            ckpts_dir = os.path.join(curr_path, 'ckpts')
+            os.system(f'mkdir -p {ckpts_dir}')
+            # os.system('wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth')
+            # os.system(f'mv groundingdino_swinb_cogcoor.pth {ckpts_dir}')
+            os.system('wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth')
+            os.system(f'mv groundingdino_swint_ogc.pth {ckpts_dir}')
+        sam_checkpoint = os.path.join(curr_path, 'ckpts/sam_vit_h_4b8939.pth')
+        if not os.path.exists(sam_checkpoint):
+            print('Downloading SAM model...')
+            ckpts_dir = os.path.join(curr_path, 'ckpts')
+            os.system(f'mkdir -p {ckpts_dir}')
+            os.system('wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth')
+            os.system(f'mv sam_vit_h_4b8939.pth {ckpts_dir}')
+        self.ground_dino_model = GroundingDINOModel(config_file, grounded_checkpoint, device=self.device)
 
         self.sam_model = SamPredictor(build_sam(checkpoint=sam_checkpoint))
         self.sam_model.model = self.sam_model.model.to(self.device)
         
-        # load XMem model]
+        # load XMem model
+        XMem_path = os.path.join(curr_path, 'XMem/saves/XMem.pth')
+        if not os.path.exists(XMem_path):
+            print('Downloading XMem model...')
+            ckpts_dir = os.path.join(curr_path, 'XMem/saves')
+            os.system(f'mkdir -p {ckpts_dir}')
+            os.system(f'wget https://github.com/hkchengrex/XMem/releases/download/v1.0/XMem.pth')
+            os.system(f'mv XMem.pth {ckpts_dir}')
         xmem_config = {
-            'model': 'XMem/saves/XMem.pth',
+            'model': XMem_path,
             'disable_long_term': False,
             'enable_long_term': True,
             'max_mid_term_frames': 10,
@@ -695,13 +331,13 @@ class Fusion():
                                         padding_mode='zeros',
                                         align_corners=True,
                                         inter_mode='nearest')[...,0] # [rfn,pn,1]
-        inter_normal = interpolate_feats(self.curr_obs_torch['normals'].permute(0,3,1,2),
-                                         pts_2d,
-                                        h = self.H,
-                                        w = self.W,
-                                        padding_mode='zeros',
-                                        align_corners=True,
-                                        inter_mode='bilinear') # [rfn,pn,3]
+        # inter_normal = interpolate_feats(self.curr_obs_torch['normals'].permute(0,3,1,2),
+        #                                  pts_2d,
+        #                                 h = self.H,
+        #                                 w = self.W,
+        #                                 padding_mode='zeros',
+        #                                 align_corners=True,
+        #                                 inter_mode='bilinear') # [rfn,pn,3]
         
         # compute the distance to the closest point on the surface
         dist = inter_depth - pts_depth # [rfn,pn]
@@ -799,6 +435,51 @@ class Fusion():
         
         return outputs
         
+        
+        # if 'dino_feats' in return_names:
+        #     inter_feats = interpolate_feats(self.curr_obs_torch['dino_feats'].permute(0,3,1,2),
+        #                                     pts_2d,
+        #                                     h = self.H,
+        #                                     w = self.W,
+        #                                     padding_mode='zeros',
+        #                                     align_corners=True,
+        #                                     inter_mode='bilinear') # [rfn,pn,feat_dim]
+        # else:
+        #     inter_feats = None
+        
+        # if 'mask_shoe' in self.curr_obs_torch and 'mask_shoe' in return_names:
+        #     inter_masks = interpolate_feats(self.curr_obs_torch['mask_shoe'].permute(0,3,1,2),
+        #                                     pts_2d,
+        #                                     h = self.H,
+        #                                     w = self.W,
+        #                                     padding_mode='zeros',
+        #                                     align_corners=True,
+        #                                     inter_mode='nearest') # [rfn,pn,nq]
+        # else:
+        #     inter_masks = None
+        
+        # # compute the features of the points
+        # if 'dino_feats' in return_names:
+        #     features = (inter_feats * dist_valid.float().unsqueeze(-1) * dist_weight.unsqueeze(-1)).sum(0) / (dist_valid.float().sum(0).unsqueeze(-1) + 1e-6) # [pn,feat_dim]
+        #     # features = (inter_feats * dist_valid.float().unsqueeze(-1)).sum(0) / (dist_valid.float().sum(0).unsqueeze(-1) + 1e-6) # [pn,feat_dim]
+        #     features[dist_all_invalid] = 0.0
+        # else:
+        #     features = None
+        
+        # # compute the query masks of the points
+        # if inter_masks is not None and 'mask_shoe' in return_names:
+        #     query_masks = (inter_masks * dist_valid.float().unsqueeze(-1) * dist_weight.unsqueeze(-1)).sum(0) / (dist_valid.float().sum(0).unsqueeze(-1) + 1e-6) # [pn,nq]
+        #     # query_masks = (inter_masks * dist_valid.float().unsqueeze(-1)).sum(0) / (dist_valid.float().sum(0).unsqueeze(-1) + 1e-6) # [pn,nq]
+        #     query_masks[dist_all_invalid] = 0.0
+        # else:
+        #     query_masks = None
+        
+        # return {'dist': dist,
+        #         'dino_feats': features,
+        #         'mask_shoe': query_masks,
+        #         'valid_mask': ~dist_all_invalid}
+    
+    
         # if 'dino_feats' in return_names:
         #     inter_feats = interpolate_feats(self.curr_obs_torch['dino_feats'].permute(0,3,1,2),
         #                                     pts_2d,
@@ -845,7 +526,7 @@ class Fusion():
     def batch_eval(self, pts, return_names=['dino_feats', 'mask']):
         batch_pts = 60000
         outputs = {}
-        for i in tqdm(range(0, pts.shape[0], batch_pts)):
+        for i in range(0, pts.shape[0], batch_pts):
             st_idx = i
             ed_idx = min(i + batch_pts, pts.shape[0])
             out = self.eval(pts[st_idx:ed_idx], return_names=return_names)
@@ -863,6 +544,30 @@ class Fusion():
                 outputs[k] = None
         return outputs
     
+    
+    # def extract_dist_vol(self, boundaries):
+    #     step = 0.002
+    #     init_grid, grid_shape = create_init_grid(boundaries, step)
+    #     init_grid = init_grid.to(self.device, dtype=torch.float32)
+        
+    #     batch_pts = 10000
+        
+    #     dist_vol = torch.zeros(init_grid.shape[0], dtype=torch.float32, device=self.device)
+    #     valid_mask = torch.zeros(init_grid.shape[0], dtype=torch.bool, device=self.device)
+        
+    #     for i in range(0, init_grid.shape[0], batch_pts):
+    #         st_idx = i
+    #         ed_idx = min(i + batch_pts, init_grid.shape[0])
+    #         out = self.eval(init_grid[st_idx:ed_idx], return_names={})
+            
+    #         dist_vol[st_idx:ed_idx] = out['dist']
+    #         valid_mask[st_idx:ed_idx] = out['valid_mask']
+    #     return {'init_grid': init_grid,
+    #             'grid_shape': grid_shape,
+    #             'dist': dist_vol,
+    #             'valid_mask': valid_mask,}
+
+
     # def extract_dist_vol(self, boundaries):
     #     step = 0.002
     #     init_grid, grid_shape = create_init_grid(boundaries, step)
@@ -908,7 +613,7 @@ class Fusion():
             img = Image.fromarray(imgs[j])
             imgs_tensor[j] = transform(img)[:3]
         with torch.no_grad():
-            features_dict = self.dinov2_feat_extractor.forward_features(imgs_tensor)
+            features_dict = self.dinov2_feat_extractor.forward_features(imgs_tensor.to(dtype=self.dtype))
             features = features_dict['x_norm_patchtokens']
             features = features.reshape((K, patch_h, patch_w, feat_dim))
         return features
@@ -920,59 +625,6 @@ class Fusion():
         # :return features: (K, patch_h, patch_w, feat_dim) np array, features of the images
         if self.feat_backbone == 'dinov2':
             return self.extract_dinov2_features(imgs, params)
-        elif self.feat_backbone == 'dino':
-            K, H, W, _ = imgs.shape
-            
-            transform = T.Compose([
-                # T.GaussianBlur(9, sigma=(0.1, 2.0)),
-                T.Resize((H, W)),
-                T.CenterCrop((H, W)),
-                T.ToTensor(),
-                T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ])
-            
-            imgs_tensor = torch.zeros((K, 3, H, W), device=self.device)
-            for j in range(K):
-                img = Image.fromarray(imgs[j])
-                imgs_tensor[j] = transform(img)[:3]
-            with torch.no_grad():
-                features = self.feat_extractor.extract_descriptors(imgs_tensor)
-            return features
-        elif self.feat_backbone == 'don':
-            K, H, W, _ = imgs.shape
-            
-            transform = T.Compose([
-                # T.GaussianBlur(9, sigma=(0.1, 2.0)),
-                # T.Resize((H, W)),
-                # T.CenterCrop((H, W)),
-                T.ToTensor(),
-                # T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                T.Normalize(mean=(0.5573105812072754, 0.37420374155044556, 0.37020164728164673), std=(0.24336038529872894, 0.2987397611141205, 0.31875079870224)),
-            ])
-            
-            imgs_tensor = torch.zeros((K, 3, H, W), device=self.device)
-            for j in range(K):
-                img = Image.fromarray(imgs[j])
-                imgs_tensor[j] = transform(img)[:3]
-            with torch.no_grad():
-                # features = self.feat_extractor(torch.flip(imgs_tensor, dims=[1]))
-                features = []
-                for i in range(K):
-                    # features.append(self.feat_extractor.forward_on_img(img))
-                    features.append(self.feat_extractor.forward_single_image_tensor(imgs_tensor[i]))
-                features = torch.stack(features, dim=0)
-                # norm = torch.norm(features, 2, 1, keepdim=True) # [N,1,H,W]
-                # features = features/norm
-            # feature = features.detach().cpu().numpy()
-            # feature_map = feature[0, 2, :, :]
-            # plt.imshow(feature_map)
-            # plt.show()
-            # reshape to (K, patch_h, patch_w, feat_dim)
-            # for i in range(K):
-            #     for j in range(3):
-            #         features[i, j] = (features[i, j] - features[i, j].min()) / (features[i, j].max() - features[i, j].min())
-            # features = features.permute(0, 2, 3, 1)
-            return features
         else:
             raise NotImplementedError
     
@@ -1029,7 +681,7 @@ class Fusion():
                 # out_mask = instance2onehot(out_mask)
                 out_masks[view_i] = torch.from_numpy(out_mask).to(self.device, dtype=torch.uint8)
             out_masks = instance2onehot(out_masks, len(self.track_ids))
-        return out_masks.to(self.device, dtype=torch.float32)
+        return out_masks.to(self.device, dtype=self.dtype)
     
     def update(self, obs):
         # :param obs: dict contains:
@@ -1040,8 +692,8 @@ class Fusion():
         self.num_cam = obs['color'].shape[0]
         color = obs['color']
         params = {
-            'patch_h': color.shape[1] // 14,
-            'patch_w': color.shape[2] // 14,
+            'patch_h': color.shape[1] // 10,
+            'patch_w': color.shape[2] // 10,
         }
         features = self.extract_features(color, params)
         
@@ -1053,533 +705,397 @@ class Fusion():
         #     'K': torch.from_numpy(obs['K']).to(self.device, dtype=torch.float32),
         # }
         self.curr_obs_torch['dino_feats'] = features
-        if self.feat_backbone == 'dinov2':
-            self.curr_obs_torch['dino_v2_feats'] = features
-        else:
-            self.curr_obs_torch['dino_v2_feats'] = self.extract_dinov2_features(color, params)
         self.curr_obs_torch['color'] = color
-        normals_np = [depth2normal(obs['depth'][i], obs['K'][i]) for i in range(self.num_cam)]
-        normals_np = np.stack(normals_np, axis=0)
-        self.curr_obs_torch['normals'] = torch.from_numpy(normals_np).to(self.device, dtype=torch.float32)
-        self.curr_obs_torch['color_tensor'] = torch.from_numpy(color).to(self.device, dtype=torch.float32) / 255.0
-        self.curr_obs_torch['depth'] = torch.from_numpy(obs['depth']).to(self.device, dtype=torch.float32)
-        self.curr_obs_torch['pose'] = torch.from_numpy(obs['pose']).to(self.device, dtype=torch.float32)
-        self.curr_obs_torch['K'] = torch.from_numpy(obs['K']).to(self.device, dtype=torch.float32)
+        self.curr_obs_torch['color_tensor'] = torch.from_numpy(color).to(self.device, dtype=self.dtype) / 255.0
+        self.curr_obs_torch['depth'] = torch.from_numpy(obs['depth']).to(self.device, dtype=self.dtype)
+        self.curr_obs_torch['pose'] = torch.from_numpy(obs['pose']).to(self.device, dtype=self.dtype)
+        self.curr_obs_torch['K'] = torch.from_numpy(obs['K']).to(self.device, dtype=self.dtype)
         
         _, self.H, self.W = obs['depth'].shape
     
-    # DEPRECATED
-    # def text_query(self, queries, thresholds):
-    #     assert len(queries) == len(thresholds)
-    #     if 'color' not in self.curr_obs_torch:
-    #         print('Please call update() first!')
-    #         exit()
-        
-    #     K = self.curr_obs_torch['color'].shape[0]
-    #     NQ = len(queries)
-    #     query_masks = torch.zeros((K, self.H, self.W, NQ), device=self.device)
-    #     for i in range(K):
-    #         masks = grounded_sam_batch_queries_np(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds)
-    #         query_masks[i] = masks.permute(1,2,0)
-    #     self.curr_obs_torch['mask'] = query_masks # [K, H, W, NQ]
+    def voxel_downsample(self, pcd, voxel_size):
+        # :param pcd: [N,3] numpy array
+        # :param voxel_size: float
+        # :return: [M,3] numpy array
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pcd))
+        pcd_down = pcd.voxel_down_sample(voxel_size)
+        return np.asarray(pcd_down.points)
     
-    # DEPRECATED: it only works for one type of object
-    # def align_instance_mask(self, query):
-    #     pose_0 = self.curr_obs_torch['pose'][0]
-    #     K_0 = self.curr_obs_torch['K'][0]
-    #     depth_0 = self.curr_obs_torch['depth'][0]
-    #     num_view = self.curr_obs_torch['color'].shape[0]
-    #     mask_0 = self.curr_obs_torch[f'mask_{query}'][0]
-    #     for i in range(1, num_view):
-    #         mask_i = self.curr_obs_torch[f'mask_{query}'][i]
-    #         num_instance = int(mask_i.max().item())
-    #         pose_i = self.curr_obs_torch['pose'][i]
-    #         pose_i = torch.cat([pose_i, torch.tensor([[0, 0, 0, 1]], device=self.device, dtype=torch.float32)], dim=0)
-    #         pose_i = torch.inverse(pose_i)
-    #         K_i = self.curr_obs_torch['K'][i]
-    #         depth_i = self.curr_obs_torch['depth'][i]
-    #         camera_param_i = [K_i[0, 0].item(),
-    #                           K_i[1, 1].item(),
-    #                           K_i[0, 2].item(),
-    #                           K_i[1, 2].item(),]
-    #         new_mask_i = torch.zeros_like(mask_i).to(self.device, dtype=torch.uint8)
-    #         for j in range(1, num_instance+1):
-    #             mask_i_inst_j = (mask_i == j)
-    #             pcd_i_np = depth2fgpcd(depth_i.cpu().numpy(), mask_i_inst_j.cpu().numpy(), camera_param_i)
-    #             pcd_i = torch.from_numpy(pcd_i_np).to(self.device, dtype=torch.float32)
-                
-    #             # # numpy version for reference
-    #             # pose = np.concatenate([pose, np.array([[0, 0, 0, 1]])], axis=0)
-    #             # pose = np.linalg.inv(pose)
-    #             # trans_pcd = pose @ np.concatenate([pcd.T, np.ones((1, pcd.shape[0]))], axis=0)
-                
-    #             # torch version
-    #             pcd_i = torch.cat([pcd_i.T, torch.ones((1, pcd_i.shape[0]), device=self.device, dtype=torch.float32)], dim=0)
-    #             pcd_i = (pose_i @ pcd_i)[:3].T
-                
-    #             pts_2d, valid_mask, pts_depth = project_points_coords(pcd_i, pose_0[None], K_0[None]) # [1,N,2], [1,N], [1,N,1]
-    #             pts_depth = pts_depth[...,0] # [1,N]
-                
-    #             # get interpolated depth and features
-    #             inter_depth = interpolate_feats(depth_0[None,None],
-    #                                             pts_2d,
-    #                                             h = self.H,
-    #                                             w = self.W,
-    #                                             padding_mode='zeros',
-    #                                             align_corners=True,
-    #                                             inter_mode='nearest')[...,0] # [1,N]
-    #             num_vis_list = [] # count the visibility of each point on mask_0
-    #             for k in range(1, num_instance+1):
-    #                 mask_0_inst_k = (mask_0 == k)
-    #                 inter_mask = interpolate_feats(mask_0_inst_k[None,None].to(torch.float32),
-    #                                                pts_2d,
-    #                                                h=self.H,
-    #                                                w=self.W,
-    #                                                padding_mode='zeros',
-    #                                                align_corners=True,
-    #                                                inter_mode='nearest')[...,0] # [1,N]
-    #                 inter_mask = inter_mask > 0.5
-                    
-    #                 num_vis = ((torch.abs(pts_depth - inter_depth) < 0.03 ) & inter_mask).sum().item()
-    #                 num_vis_list.append(num_vis)
-    #             max_vis_arg = np.argmax(num_vis_list)
-    #             new_mask_i[mask_i_inst_j] = max_vis_arg + 1
-    #         self.curr_obs_torch[f'mask_{query}'][i] = new_mask_i
+    def pcd_iou(self, pcd_1, pcd_2, threshold):
+        # :param pcd_1 [N,3] numpy array
+        # :param pcd_2 [M,3] numpy array
+        # voxel downsample
+        # voxel_size = threshold
+        # pcd_1 = self.voxel_downsample(pcd_1, voxel_size)
+        # pcd_2 = self.voxel_downsample(pcd_2, voxel_size)
+        dist = np.linalg.norm(pcd_1[:,None] - pcd_2[None], axis=-1) # [N,M]
+        min_dist_from_1_to_2 = dist.min(axis=1) # [N]
+        min_idx_from_1_to_2 = dist.argmin(axis=1) # [N]
+        min_dist_from_2_to_1 = dist.min(axis=0) # [M]
+        min_idx_from_2_to_1 = dist.argmin(axis=0) # [M]
+        iou = ((min_dist_from_1_to_2 < threshold).sum() + (min_dist_from_2_to_1 < threshold).sum()) / (pcd_1.shape[0] + pcd_2.shape[0])
+        iou_1 = (min_dist_from_1_to_2 < threshold).sum() / pcd_1.shape[0]
+        iou_2 = (min_dist_from_2_to_1 < threshold).sum() / pcd_2.shape[0]
+        overlap_idx_1 = np.where(min_dist_from_1_to_2 < threshold)[0]
+        overlap_idx_2 = np.where(min_dist_from_2_to_1 < threshold)[0]
+        return iou, iou_1, iou_2, overlap_idx_1, overlap_idx_2, min_idx_from_1_to_2, min_idx_from_2_to_1
     
-    # def align_instance_mask(self):
-    #     # NOTE: assume all objects are visible in the first frame. In another word, labels in different views are identical.
-    #     num_view = self.curr_obs_torch['color'].shape[0]
-    #     for i in range(num_view):
-    #         assert self.curr_obs_torch['mask_label'][0] == self.curr_obs_torch['mask_label'][i]
-    #     pose_0 = self.curr_obs_torch['pose'][0]
-    #     K_0 = self.curr_obs_torch['K'][0]
-    #     depth_0 = self.curr_obs_torch['depth'][0]
-    #     mask_0 = self.curr_obs_torch[f'mask'][0]
-    #     label_0 = self.curr_obs_torch['mask_label'][0]
-    #     for i in range(1, num_view):
-    #         mask_i = self.curr_obs_torch[f'mask'][i]
-    #         label_i = self.curr_obs_torch['mask_label'][i]
-    #         num_instance = len(label_0) - 1
-    #         pose_i = self.curr_obs_torch['pose'][i]
-    #         pose_i = torch.cat([pose_i, torch.tensor([[0, 0, 0, 1]], device=self.device, dtype=torch.float32)], dim=0)
-    #         pose_i = torch.inverse(pose_i)
-    #         K_i = self.curr_obs_torch['K'][i]
-    #         depth_i = self.curr_obs_torch['depth'][i]
-    #         camera_param_i = [K_i[0, 0].item(),
-    #                           K_i[1, 1].item(),
-    #                           K_i[0, 2].item(),
-    #                           K_i[1, 2].item(),]
-    #         new_mask_i = torch.zeros_like(mask_i).to(self.device, dtype=torch.uint8)
-    #         for j in range(1, num_instance+1):
-    #             mask_i_inst_j = (mask_i == j)
-    #             pcd_i_np = depth2fgpcd(depth_i.cpu().numpy(), mask_i_inst_j.cpu().numpy(), camera_param_i)
-    #             pcd_i = torch.from_numpy(pcd_i_np).to(self.device, dtype=torch.float32)
-                
-    #             # # numpy version for reference
-    #             # pose = np.concatenate([pose, np.array([[0, 0, 0, 1]])], axis=0)
-    #             # pose = np.linalg.inv(pose)
-    #             # trans_pcd = pose @ np.concatenate([pcd.T, np.ones((1, pcd.shape[0]))], axis=0)
-                
-    #             # torch version
-    #             pcd_i = torch.cat([pcd_i.T, torch.ones((1, pcd_i.shape[0]), device=self.device, dtype=torch.float32)], dim=0)
-    #             pcd_i = (pose_i @ pcd_i)[:3].T
-                
-    #             pts_2d, valid_mask, pts_depth = project_points_coords(pcd_i, pose_0[None], K_0[None]) # [1,N,2], [1,N], [1,N,1]
-    #             pts_depth = pts_depth[...,0] # [1,N]
-                
-    #             # get interpolated depth and features
-    #             inter_depth = interpolate_feats(depth_0[None,None],
-    #                                             pts_2d,
-    #                                             h = self.H,
-    #                                             w = self.W,
-    #                                             padding_mode='zeros',
-    #                                             align_corners=True,
-    #                                             inter_mode='nearest')[...,0] # [1,N]
-    #             num_vis_list = [] # count the visibility of each point on mask_0
-    #             for k in range(1, num_instance+1):
-    #                 if label_i[j] != label_0[k]:
-    #                     num_vis_list.append(0)
-    #                     continue
-    #                 mask_0_inst_k = (mask_0 == k)
-    #                 inter_mask = interpolate_feats(mask_0_inst_k[None,None].to(torch.float32),
-    #                                                pts_2d,
-    #                                                h=self.H,
-    #                                                w=self.W,
-    #                                                padding_mode='zeros',
-    #                                                align_corners=True,
-    #                                                inter_mode='nearest')[...,0] # [1,N]
-    #                 inter_mask = inter_mask > 0.5
-                    
-    #                 num_vis = ((torch.abs(pts_depth - inter_depth) < 0.03 ) & inter_mask).sum().item()
-    #                 num_vis_list.append(num_vis)
-    #             max_vis_arg = np.argmax(num_vis_list)
-    #             new_mask_i[mask_i_inst_j] = max_vis_arg + 1
-    #         self.curr_obs_torch[f'mask'][i] = new_mask_i
-    
-    def compute_alignment(self, v_i, v_j, inst_n, inst_m):
-        # :param v_i, view index i
-        # :param v_j, view index j
-        # :param inst_n, instance index in view i
-        # :param inst_m, instance index in view j
-        # :return: visiblity score (# of visible points)
-        
-        # extract information from view i
-        mask_i = self.curr_obs_torch['mask'][v_i] # [H,W]
-        mask_i_inst_n = (mask_i == inst_n)
-        depth_i = self.curr_obs_torch['depth'][v_i] # [H,W]
-        pose_i = self.curr_obs_torch['pose'][v_i]
-        pose_i_homo = torch.cat([pose_i, torch.tensor([[0, 0, 0, 1]], device=self.device, dtype=torch.float32)], dim=0)
-        pose_i_inv = torch.inverse(pose_i_homo)
-        K_i = self.curr_obs_torch['K'][v_i]
-        depth_i = self.curr_obs_torch['depth'][v_i]
-        camera_param_i = [K_i[0, 0].item(),
-                            K_i[1, 1].item(),
-                            K_i[0, 2].item(),
-                            K_i[1, 2].item(),]
-        
-        pcd_i_np = depth2fgpcd(depth_i.cpu().numpy(), mask_i_inst_n.cpu().numpy(), camera_param_i)
-        pcd_i = torch.from_numpy(pcd_i_np).to(self.device, dtype=torch.float32)
-        pcd_i = torch.cat([pcd_i.T, torch.ones((1, pcd_i.shape[0]), device=self.device, dtype=torch.float32)], dim=0)
-        pcd_i = (pose_i_inv @ pcd_i)[:3].T
-        
-        # extract information from view j        
-        mask_j = self.curr_obs_torch['mask'][v_j] # [H,W]
-        mask_j_inst_m = (mask_j == inst_m)
-        depth_j = self.curr_obs_torch['depth'][v_j] # [H,W]
-        pose_j = self.curr_obs_torch['pose'][v_j]
-        pose_j_homo = torch.cat([pose_j, torch.tensor([[0, 0, 0, 1]], device=self.device, dtype=torch.float32)], dim=0)
-        pose_j_inv = torch.inverse(pose_j_homo)
-        K_j = self.curr_obs_torch['K'][v_j]
-        depth_j = self.curr_obs_torch['depth'][v_j]
-        camera_param_j = [K_j[0, 0].item(),
-                            K_j[1, 1].item(),
-                            K_j[0, 2].item(),
-                            K_j[1, 2].item(),]
-        
-        pcd_j_np = depth2fgpcd(depth_j.cpu().numpy(), mask_j_inst_m.cpu().numpy(), camera_param_j)
-        pcd_j = torch.from_numpy(pcd_j_np).to(self.device, dtype=torch.float32)
-        pcd_j = torch.cat([pcd_j.T, torch.ones((1, pcd_j.shape[0]), device=self.device, dtype=torch.float32)], dim=0)
-        pcd_j = (pose_j_inv @ pcd_j)[:3].T
-        
-        # project i in j
-        pts_2d_i_in_j, valid_mask, pts_depth_i_in_j = project_points_coords(pcd_i, pose_j[None], K_j[None]) # [1,N,2], [1,N], [1,N,1]
-        pts_depth_i_in_j = pts_depth_i_in_j[...,0] # [1,N]
-        inter_depth_i_in_j = interpolate_feats(depth_j[None,None],
-                                               pts_2d_i_in_j,
-                                               h = self.H,
-                                               w = self.W,
-                                               padding_mode='zeros',
-                                               align_corners=True,
-                                               inter_mode='nearest')[...,0] # [1,N]
-        
-        inter_mask_i_in_j = interpolate_feats(mask_j_inst_m[None,None].to(torch.float32),
-                                              pts_2d_i_in_j,
-                                              h=self.H,
-                                              w=self.W,
-                                              padding_mode='zeros',
-                                              align_corners=True,
-                                              inter_mode='nearest')[...,0] # [1,N]
-        inter_mask_i_in_j = inter_mask_i_in_j > 0.5
-        
-        # project j in i
-        pts_2d_j_in_i, valid_mask, pts_depth_j_in_i = project_points_coords(pcd_j, pose_i[None], K_i[None]) # [1,N,2], [1,N], [1,N,1]
-        pts_depth_j_in_i = pts_depth_j_in_i[...,0] # [1,N]
-        inter_depth_j_in_i = interpolate_feats(depth_i[None,None],
-                                               pts_2d_j_in_i,
-                                               h = self.H,
-                                               w = self.W,
-                                               padding_mode='zeros',
-                                               align_corners=True,
-                                               inter_mode='nearest')[...,0]
-        inter_mask_j_in_i = interpolate_feats(mask_i_inst_n[None,None].to(torch.float32),
-                                                pts_2d_j_in_i,
-                                                h=self.H,
-                                                w=self.W,
-                                                padding_mode='zeros',
-                                                align_corners=True,
-                                                inter_mode='nearest')[...,0] # [1,N]
-        inter_mask_j_in_i = inter_mask_j_in_i > 0.5
-
-        num_vis = ((torch.abs(pts_depth_i_in_j - inter_depth_i_in_j) < 0.03 ) & inter_mask_i_in_j).sum().item() +\
-                    ((torch.abs(pts_depth_j_in_i - inter_depth_j_in_i) < 0.03 ) & inter_mask_j_in_i).sum().item()
-        
-        return num_vis
-    
-    def add_mask_in_j_use_i_inst_n(self, v_i, v_j, inst_n):
-        # :param v_i, view index i with inst_n
-        # :param v_j, view index j with missing mask
-                # :param v_i, view index i
-        # :param v_j, view index j
-        # :param inst_n, instance index in view i
-        # :param inst_m, instance index in view j
-        # :return: visiblity score (# of visible points)
-        
-        # extract information from view i
-        mask_i = self.curr_obs_torch['mask'][v_i] # [H,W]
-        mask_i_inst_n = (mask_i == inst_n)
-        depth_i = self.curr_obs_torch['depth'][v_i] # [H,W]
-        pose_i = self.curr_obs_torch['pose'][v_i]
-        pose_i_homo = torch.cat([pose_i, torch.tensor([[0, 0, 0, 1]], device=self.device, dtype=torch.float32)], dim=0)
-        pose_i_inv = torch.inverse(pose_i_homo)
-        K_i = self.curr_obs_torch['K'][v_i]
-        depth_i = self.curr_obs_torch['depth'][v_i]
-        camera_param_i = [K_i[0, 0].item(),
-                            K_i[1, 1].item(),
-                            K_i[0, 2].item(),
-                            K_i[1, 2].item(),]
-        
-        mask_i_inst_n = mask_i_inst_n.cpu().numpy().astype(np.uint8)
-        mask_i_inst_n = (cv2.erode(mask_i_inst_n * 255, np.ones([10, 10], np.uint8), iterations=1) / 255).astype(bool)
-        pcd_i_np = depth2fgpcd(depth_i.cpu().numpy(), mask_i_inst_n, camera_param_i)
-        pcd_i = torch.from_numpy(pcd_i_np).to(self.device, dtype=torch.float32)
-        pcd_i = torch.cat([pcd_i.T, torch.ones((1, pcd_i.shape[0]), device=self.device, dtype=torch.float32)], dim=0)
-        pcd_i = (pose_i_inv @ pcd_i)[:3].T
-        
-        # extract information from view j        
-        depth_j = self.curr_obs_torch['depth'][v_j] # [H,W]
-        pose_j = self.curr_obs_torch['pose'][v_j]
-        K_j = self.curr_obs_torch['K'][v_j]
-        depth_j = self.curr_obs_torch['depth'][v_j]
-        
-        # project i in j
-        pts_2d_i_in_j, valid_mask, pts_depth_i_in_j = project_points_coords(pcd_i, pose_j[None], K_j[None]) # [1,N,2], [1,N], [1,N,1]
-        pts_depth_i_in_j = pts_depth_i_in_j[...,0] # [1,N]
-        inter_depth_i_in_j = interpolate_feats(depth_j[None,None],
-                                               pts_2d_i_in_j,
-                                               h = self.H,
-                                               w = self.W,
-                                               padding_mode='zeros',
-                                               align_corners=True,
-                                               inter_mode='nearest')[...,0] # [1,N]
-        pts_i_visible_in_j = ((torch.abs(pts_depth_i_in_j - inter_depth_i_in_j) < 0.02) & valid_mask)[0] # [N]
-        
-        pts_2d_i_in_j = pts_2d_i_in_j[0][pts_i_visible_in_j] # [M, 2]
-        
-        if pts_2d_i_in_j.shape[0] == 0:
-            return None
-        
-        input_point = pts_2d_i_in_j.detach().cpu().numpy().astype(np.int32)
-        input_label = np.ones((input_point.shape[0],), dtype=np.int32)
-
-        self.sam_model.set_image(self.curr_obs_torch['color'][v_j])
-        masks, _, _ = self.sam_model.predict(
-            point_coords=input_point,
-            point_labels=input_label,
-            multimask_output=False,
-        )
-        return masks[0]
-        
-    def compute_alignment_with_consensus(self, v_i, inst_n, consensus_mask_dict, consensus_i):
-        curr_view_inst_dict = consensus_mask_dict[consensus_i]
-        avg_align = []
-        for curr_view, curr_inst in curr_view_inst_dict.items():
-            if curr_view == v_i or curr_inst == -1:
-                continue
-            avg_align.append(self.compute_alignment(curr_view, v_i, curr_inst, inst_n))
-        avg_align = np.mean(avg_align)
-        return avg_align
-    
-    def update_with_missing_label(self, consensus_mask_label, consensus_mask_dict, v_i):
-        len_i = len(self.curr_obs_torch['mask_label'][v_i])
-        mask_label_i = self.curr_obs_torch['mask_label'][v_i]
-        len_curr = len(consensus_mask_label)
-        assert len_i < len_curr
-        for label_i, label in enumerate(mask_label_i):
-            align_ls = []
-            for consensus_i, consensus_label in enumerate(consensus_mask_label):
-                if label != consensus_label:
-                    # skip when the label is not the same
-                    align_ls.append(-1)
+    def merge_instances_from_new_view(self, instances_info, i, boundaries):
+        mask_label = self.curr_obs_torch['mask_label'][i]
+        assert mask_label[0] == 'background'
+        for j, label in enumerate(mask_label):
+            # if j == 0:
+            #     continue
+            pcd_i = self.extract_masked_pcd_in_views([j], [i], boundaries, downsample=True) # (N,3) in numpy array
+            is_new_inst = True
+            max_iou = 0
+            max_iou_idx = -1
+            for k, info in enumerate(instances_info):
+                # Check 1: name matches
+                if label != info['label']:
                     continue
-                align_ls.append(self.compute_alignment_with_consensus(v_i, label_i, consensus_mask_dict, consensus_i))
-            matched_consensus_i = np.argmax(align_ls)
-            try:
-                assert v_i not in consensus_mask_dict[matched_consensus_i]
-            except:
-                print(f'{v_i} is already in {consensus_mask_dict} at {matched_consensus_i}')
-                raise AssertionError
-            consensus_mask_dict[matched_consensus_i][v_i] = label_i
-        # add the missing label
-        for consensus_i, consensus_label in enumerate(consensus_mask_label):
-            if v_i in consensus_mask_dict[consensus_i]:
-                continue
-            consensus_mask_dict[consensus_i][v_i] = -1
-            
-            # # add mask
-            # existing_match = consensus_mask_dict[consensus_i]
-            # successful_adding = False
-            # for v_j, inst_j in existing_match.items():
-            #     if inst_j == -1:
-            #         continue
-            #     add_mask = self.add_mask_in_j_use_i_inst_n(v_j, v_i, inst_j)
-            #     if add_mask is None:
-            #         continue
-            #     else:
-            #         successful_adding = True
-            #         break
-            # if not successful_adding:
-            #     consensus_mask_dict[consensus_i][v_i] = -1
-            # else:
-            #     consensus_mask_dict[consensus_i][v_i] = len(self.curr_obs_torch['mask_label'][v_i])
-            #     self.curr_obs_torch['mask'][v_i][add_mask > 0.5] = len(self.curr_obs_torch['mask_label'][v_i])
-            #     self.curr_obs_torch['mask_label'][v_i].append(consensus_label)
-            
-        return consensus_mask_label, consensus_mask_dict
-    
-    def update_with_equal_label(self, consensus_mask_label, consensus_mask_dict, v_i):
-        len_i = len(self.curr_obs_torch['mask_label'][v_i])
-        mask_label_i = self.curr_obs_torch['mask_label'][v_i]
-        len_curr = len(consensus_mask_label)
-        assert len_i == len_curr
-        for label_i, label in enumerate(mask_label_i):
-            align_ls = []
-            for consensus_i, consensus_label in enumerate(consensus_mask_label):
-                if label != consensus_label:
-                    # skip when the label is not the same
-                    align_ls.append(-1)
-                    continue
-                align_ls.append(self.compute_alignment_with_consensus(v_i, label_i, consensus_mask_dict, consensus_i))
-            matched_consensus_i = np.argmax(align_ls)
-            try:
-                assert v_i not in consensus_mask_dict[matched_consensus_i]
-            except:
-                print(f'{v_i} is already in {consensus_mask_dict} at {matched_consensus_i}')
-                raise AssertionError
-            consensus_mask_dict[matched_consensus_i][v_i] = label_i
-        # assert whether all labels are matched
-        for consensus_i, consensus_label in enumerate(consensus_mask_label):
-            try:
-                assert v_i in consensus_mask_dict[consensus_i]
-            except:
-                print(f'{v_i} is not in {consensus_mask_dict} at {consensus_i}')
-                print(f'hint: curr view label {mask_label_i}')
-                print(f'hint: curr consensus label {consensus_mask_label}')
-                exit()
-        return consensus_mask_label, consensus_mask_dict
-    
-    def update_with_additional_label(self, consensus_mask_label, consensus_mask_dict, v_i):
-        len_i = len(self.curr_obs_torch['mask_label'][v_i])
-        mask_label_i = self.curr_obs_torch['mask_label'][v_i]
-        len_curr = len(consensus_mask_label)
-        assert len_i > len_curr
-        matched_label_idx_ls = []
-        for consensus_i, consensus_label in enumerate(consensus_mask_label):
-            align_ls = []
-            for label_i, label in enumerate(mask_label_i):
-                if label != consensus_label:
-                    # skip when the label is not the same
-                    align_ls.append(-1)
-                    continue
-                align_ls.append(self.compute_alignment_with_consensus(v_i, label_i, consensus_mask_dict, consensus_i))
-            matched_label_i = np.argmax(align_ls)
-            consensus_mask_dict[consensus_i][v_i] = matched_label_i
-            matched_label_idx_ls.append(matched_label_i)
-        
-        # do nothing
-        for inst_i in range(len_i):
-            if inst_i in matched_label_idx_ls:
-                continue
-            consensus_mask_label.append(mask_label_i[inst_i])
-            consensus_mask_dict[len_curr] = {v_i: inst_i}
-            for prev_v_i in range(v_i):
-                consensus_mask_dict[len_curr][prev_v_i] = -1
-            len_curr += 1
-        
-        # # add additional label
-        # for inst_i in range(len_i):
-        #     if inst_i in matched_label_idx_ls:
-        #         continue
-        #     consensus_mask_label.append(mask_label_i[inst_i])
-        #     consensus_mask_dict[len_curr] = {v_i: inst_i}
-        #     for prev_v_i in range(v_i):
-        #         add_mask = self.add_mask_in_j_use_i_inst_n(v_i, prev_v_i, inst_i)
-        #         if add_mask is None:
-        #             consensus_mask_dict[len_curr][prev_v_i] = -1
-        #         else:
-        #             consensus_mask_dict[len_curr][prev_v_i] = len(self.curr_obs_torch['mask_label'][prev_v_i])
-        #             self.curr_obs_torch['mask'][prev_v_i][add_mask > 0.5] = len(self.curr_obs_torch['mask_label'][prev_v_i])
-        #             self.curr_obs_torch['mask_label'][prev_v_i].append(mask_label_i[inst_i])
-        #     len_curr += 1
                 
-        return consensus_mask_label, consensus_mask_dict
-
-    def adjust_masks_using_consensus(self, consensus_mask_label, consensus_mask_dict, use_other):
-        old_masks = self.curr_obs_torch['mask'].clone()
-        new_masks = self.curr_obs_torch['mask'].clone()
-        H, W = old_masks.shape[1:]
-        for consensus_i, consensus_label in enumerate(consensus_mask_label):
+                # Check 2: compute iou
+                pcd_inst = np.concatenate([info['pcd'][view_idx] for view_idx in info['pcd'].keys()], axis=0)
+                iou, _, _, _, _, _, _ = self.pcd_iou(pcd_i, pcd_inst, threshold=self.iou_threshold)
+                if iou > max_iou:
+                    max_iou = iou
+                    max_iou_idx = k
             
-            visible_views = []
-            for v_i, label_i in consensus_mask_dict[consensus_i].items():
-                if label_i != -1:
-                    visible_views.append(v_i)
-                    
-            for v_i, label_i in consensus_mask_dict[consensus_i].items():
-                if label_i == -1:
-                    # continue
-                    
-                    # add additional label
-                    for v_j in visible_views:
-                        inst_j = consensus_mask_dict[consensus_i][v_j]
-                        if use_other:
-                            add_mask = self.add_mask_in_j_use_i_inst_n(v_j, v_i, inst_j)
-                        else:
-                            add_mask = None
-                        if add_mask is None:
-                            continue
-                        consensus_mask_dict[consensus_i][v_i] = len(self.curr_obs_torch['mask_label'][v_i])
-                        new_masks[v_i][add_mask > 0.5] = consensus_i
-                        self.curr_obs_torch['mask_label'][v_i].append(consensus_label)
-                        break
-                else:
-                    mask_i = old_masks[v_i]
-                    mask_i_inst_label_i = (mask_i == label_i)
-                    new_masks[v_i][mask_i_inst_label_i] = consensus_i
-        self.curr_obs_torch['mask'] = new_masks
-    
-    def order_consensus(self, consensus_mask_label, consensus_mask_dict, queries):
-        queries_wo_period = [query[:-1] if query[-1] == '.' else query for query in queries]
-        # the order of consensus is the order of queries
-        new_consesus_mask_label = [consensus_mask_label[0]]
-        new_consesus_mask_dict = {0: consensus_mask_dict[0]}
-        for query in queries_wo_period:
-            # find all indices of query in consensus_mask_label
-            for i, label in enumerate(consensus_mask_label):
-                if label == query:
-                    new_consesus_mask_label.append(label)
-                    new_consesus_mask_dict[len(new_consesus_mask_label)-1] = consensus_mask_dict[i]
-        return new_consesus_mask_label, new_consesus_mask_dict
-                    
-    def align_instance_mask_v2(self, queries, use_other=True):
-        num_view = self.curr_obs_torch['color'].shape[0]
-        assert num_view > 0
-        consensus_mask_label = self.curr_obs_torch['mask_label'][0].copy()
-        consensus_mask_dict = {} # map label idx to a dict, each dict contains the view index and the instance id
-        for i, label in enumerate(consensus_mask_label):
-            consensus_mask_dict[i] = {0: i}
+            if max_iou > 0.25:
+                is_new_inst = False
             
-            # if label not in consensus_mask_dict:
-            #     consensus_mask_dict[label] = [{0: i},]
-            # else:
-            #     consensus_mask_dict[label].append({0: i})
-        
-        for i in range(1, num_view):
-            len_i = len(self.curr_obs_torch['mask_label'][i])
-            len_curr = len(consensus_mask_label)
-            
-            if len_i < len_curr:
-                # some mask labels are missing in view i
-                consensus_mask_label, consensus_mask_dict = self.update_with_missing_label(consensus_mask_label, consensus_mask_dict, i)
-            elif len_i == len_curr:
-                assert consensus_mask_label == self.curr_obs_torch['mask_label'][i]
-                # all mask labels are matched
-                consensus_mask_label, consensus_mask_dict = self.update_with_equal_label(consensus_mask_label, consensus_mask_dict, i)
+            # update instances_info
+            if is_new_inst and (label != 'background' or i == 0):
+                conf = self.curr_obs_torch['mask_conf'][i][j]
+                instances_info.append({'label': label,
+                                       'pcd': {i: pcd_i},
+                                       'conf': {i: conf},
+                                       'idx': {i: j}})
             else:
-                consensus_mask_label, consensus_mask_dict = self.update_with_additional_label(consensus_mask_label, consensus_mask_dict, i)
-                consensus_mask_label, consensus_mask_dict = self.order_consensus(consensus_mask_label, consensus_mask_dict, queries)
+                # Additional Check 1: whether this segmentation is already in the instance
+                if i in instances_info[max_iou_idx]['pcd'].keys():
+                    # choose the one with higher iou with other pcd
+                    other_pcd_ls = [instances_info[max_iou_idx]['pcd'][view_idx] for view_idx in instances_info[max_iou_idx]['pcd'].keys() if view_idx != i]
+                    if len(other_pcd_ls) > 0:
+                        other_pcd = np.concatenate([instances_info[max_iou_idx]['pcd'][view_idx] for view_idx in instances_info[max_iou_idx]['pcd'].keys() if view_idx != i], axis=0)
+                        curr_iou = self.pcd_iou(pcd_i, other_pcd, threshold=self.iou_threshold)[0]
+                        prev_pcd = instances_info[max_iou_idx]['pcd'][i]
+                        prev_iou = self.pcd_iou(pcd_i, prev_pcd, threshold=self.iou_threshold)[0]
+                        if curr_iou <= prev_iou:
+                            continue
+                
+                conf = self.curr_obs_torch['mask_conf'][i][j]
+                instances_info[max_iou_idx]['pcd'][i] = pcd_i
+                instances_info[max_iou_idx]['conf'][i] = conf
+                instances_info[max_iou_idx]['idx'][i] = j
+        return instances_info
+    
+    def vox_idx_iou(self, vox_idx_1, vox_idx_2):
+        intersection = len(
+            set(vox_idx_1).intersection(set(vox_idx_2))
+        )
+        union = len(set(vox_idx_1).union(set(vox_idx_2)))
+        return intersection / union, len(vox_idx_1) / union, len(vox_idx_2) / union
+    
+    def merge_instances_from_new_view_vox_ver(self, instances_info, i, boundaries):
+        mask_label = self.curr_obs_torch['mask_label'][i]
+        assert mask_label[0] == 'background'
+        for j, label in enumerate(mask_label):
+            # if j == 0:
+            #     continue
+            pcd_i = self.extract_masked_pcd_in_views([j], [i], boundaries) # (N,3) in numpy array
+            index_i = self.pcd_to_index(pcd_i)
+            is_new_inst = True
+            max_iou = 0
+            max_iou_idx = -1
+            for k, info in enumerate(instances_info):
+                # Check 1: name matches
+                if label != info['label']:
+                    continue
+                
+                # Check 2: compute iou
+                vox_idx_inst = info['vox_idx']
+                iou = self.vox_idx_iou(index_i, vox_idx_inst)[0]
+                if iou > max_iou:
+                    max_iou = iou
+                    max_iou_idx = k
+            
+            if max_iou > 0.20:
+                is_new_inst = False
+            
+            # update instances_info
+            if is_new_inst and (label != 'background' or i == 0):
+                conf = self.curr_obs_torch['mask_conf'][i][j]
+                conf_per_pt = {vox_i: [conf] for vox_i in index_i}
+                instances_info.append({'label': label,
+                                    #    'pcd': {i: pcd_i},
+                                       'vox_idx': index_i,
+                                       'conf_per_pt': conf_per_pt,
+                                       'idx': {i: j}})
+            else:
+                conf = self.curr_obs_torch['mask_conf'][i][j]
+                instances_info[max_iou_idx]['vox_idx'] = np.unique(np.concatenate([instances_info[max_iou_idx]['vox_idx'], index_i]))
+                if i in instances_info[max_iou_idx]['idx']:
+                    new_vox_idx = set(index_i).difference(set(instances_info[max_iou_idx]['vox_idx']))
+                    update_idx = new_vox_idx
+                else:
+                    update_idx = set(index_i)
+                for vox_i in update_idx:
+                    if vox_i not in instances_info[max_iou_idx]['conf_per_pt']:
+                        instances_info[max_iou_idx]['conf_per_pt'][vox_i] = []
+                    instances_info[max_iou_idx]['conf_per_pt'][vox_i].append(conf)
+                instances_info[max_iou_idx]['idx'][i] = j
+        return instances_info
+    
+    def del_partial_pcd(self, instance_info, pcd_idx):
+        start_idx = 0
+        for view_idx in instance_info['pcd'].keys():
+            end_idx = start_idx + instance_info['pcd'][view_idx].shape[0]
+            pcd_idx_in_view = pcd_idx[np.logical_and(pcd_idx >= start_idx, pcd_idx < end_idx)]
+            pcd_idx_in_view -= start_idx
+            instance_info['pcd'][view_idx] = np.delete(instance_info['pcd'][view_idx], pcd_idx_in_view, axis=0)
+            start_idx = end_idx
+        return instance_info
+
+    def del_partial_vox_idx(self, instance_info, vox_idx):
+        curr_vox_idx = set(instance_info['vox_idx'])
+        for vox_i in vox_idx:
+            if vox_i in instance_info['conf_per_pt']:
+                del instance_info['conf_per_pt'][vox_i]
+            if vox_i in instance_info['vox_idx']:
+                curr_vox_idx.remove(vox_i)
+        instance_info['vox_idx'] = np.array(list(curr_vox_idx))
+        return instance_info
+    
+    def filter_instances(self, instances_info):
+        to_delete = []
+
+        # Filter 1: filter instances that have a large IoU with other instances
+        for idx_i, instance_i in enumerate(instances_info):
+            if idx_i in to_delete:
+                continue
+            for idx_j, instance_j in enumerate(instances_info):
+                if idx_j <= idx_i:
+                    continue
+                if idx_j in to_delete:
+                    continue
+                
+                pcd_i = np.concatenate([instance_i['pcd'][view_idx] for view_idx in instance_i['pcd'].keys()], axis=0)
+                conf_per_pt_i = np.concatenate([np.ones(instance_i['pcd'][view_idx].shape[0]) * instance_i['conf'][view_idx] for view_idx in instance_i['pcd'].keys()])
+                pcd_j = np.concatenate([instance_j['pcd'][view_idx] for view_idx in instance_j['pcd'].keys()], axis=0)
+                conf_per_pt_j = np.concatenate([np.ones(instance_j['pcd'][view_idx].shape[0]) * instance_j['conf'][view_idx] for view_idx in instance_j['pcd'].keys()])
+                iou, iou_1, iou_2, overlap_idx_1, overlap_idx_2, min_idx_from_1_to_2, min_idx_from_2_to_1 = self.pcd_iou(pcd_i, pcd_j, threshold=0.005)
+                if iou > 0.25:
+                    # we can only keep one
+                    num_vis_view_i = len(instance_i['idx'])
+                    num_vis_view_j = len(instance_j['idx'])
+                    if num_vis_view_i > num_vis_view_j:
+                        to_delete.append(idx_j)
+                    elif num_vis_view_j > num_vis_view_i:
+                        to_delete.append(idx_i)
+                    else:
+                        # # ver 1: delete the whole instance
+                        # conf_i = np.mean([instance_i['conf'][view_idx] for view_idx in instance_i['conf'].keys()])
+                        # conf_j = np.mean([instance_j['conf'][view_idx] for view_idx in instance_j['conf'].keys()])
+                        # if conf_i > conf_j:
+                        #     to_delete.append(idx_j)
+                        # else:
+                        #     to_delete.append(idx_i)
+                        
+                        # ver 2: delete the point with less confidence
+                        overlap_conf_1 = conf_per_pt_i[overlap_idx_1]
+                        overlap_conf_2_corr_to_1 = conf_per_pt_j[min_idx_from_1_to_2[overlap_idx_1]]
+                        overlap_conf_2 = conf_per_pt_j[overlap_idx_2]
+                        overlap_conf_1_corr_to_2 = conf_per_pt_i[min_idx_from_2_to_1[overlap_idx_2]]
+                        pcd_i_del_idx = overlap_idx_1[overlap_conf_1 < overlap_conf_2_corr_to_1]
+                        pcd_j_del_idx = overlap_idx_2[overlap_conf_2 < overlap_conf_1_corr_to_2]
+                        
+                        # remove points in instance_i
+                        instance_i = self.del_partial_pcd(instance_i, pcd_i_del_idx)
+                        instance_j = self.del_partial_pcd(instance_j, pcd_j_del_idx)
+                
+                # instance_i is a subset of instance_j
+                elif iou_1 > 0.5:
+                    # we may delete instance_i or remove overlapping points in instance_j
+                    num_vis_view_i = len(instance_i['idx'])
+                    num_vis_view_j = len(instance_j['idx'])
+                    if (instance_j['label'] == 'background' and num_vis_view_i < self.num_cam // 2) or \
+                        (instance_j['label'] != 'background' and num_vis_view_i < num_vis_view_j // 2):
+                        # delete instance_i
+                        to_delete.append(idx_i)
+                    else:
+                        # remove overlapping points in instance_j
+                        instance_j = self.del_partial_pcd(instance_j, overlap_idx_2)
+                
+                # instance_j is a subset of instance_i
+                elif iou_2 > 0.5:
+                    # we may delete instance_j or remove overlapping points in instance_i
+                    num_vis_view_i = len(instance_i['idx'])
+                    num_vis_view_j = len(instance_j['idx'])
+                    if (instance_i['label'] == 'background' and num_vis_view_j < self.num_cam // 2) or \
+                        (instance_i['label'] != 'background' and num_vis_view_j < num_vis_view_i // 2):
+                        # delete instance_j
+                        to_delete.append(idx_j)
+                    else:
+                        # remove overlapping points in instance_i
+                        instance_i = self.del_partial_pcd(instance_i, overlap_idx_1)
+                
+                # immediately put instance to delete if it is too small
+                pcd_i = np.concatenate([instance_i['pcd'][view_idx] for view_idx in instance_i['pcd'].keys()], axis=0)
+                if pcd_i.shape[0] < 10:
+                    to_delete.append(idx_i)
+                pcd_j = np.concatenate([instance_j['pcd'][view_idx] for view_idx in instance_j['pcd'].keys()], axis=0)
+                if pcd_j.shape[0] < 10:
+                    to_delete.append(idx_j)
+
+        # Filter 2: filter certain instances used as background
+        for idx_i, instance_i in enumerate(instances_info):
+            if idx_i in to_delete:
+                continue
+            bg_name_ls = ['table']
+            if instance_i['label'] in bg_name_ls:
+                to_delete.append(idx_i)
+                continue
         
-        self.adjust_masks_using_consensus(consensus_mask_label, consensus_mask_dict, use_other = use_other)
-        self.curr_obs_torch['consensus_mask_label'] = consensus_mask_label
+        # Filter 3: filter instances that are too small
+        for idx_i, instance_i in enumerate(instances_info):
+            if idx_i in to_delete:
+                continue
+            pcd_i = np.concatenate([instance_i['pcd'][view_idx] for view_idx in instance_i['pcd'].keys()], axis=0)
+            if pcd_i.shape[0] < 10:
+                to_delete.append(idx_i)
+                continue
+        
+        for idx in sorted(to_delete, reverse=True):
+            del instances_info[idx]
+        
+        return instances_info
+    
+    def filter_instances_vox_ver(self, instances_info):
+        to_delete = []
+
+        # Filter 1: filter instances that have a large IoU with other instances
+        for idx_i, instance_i in enumerate(instances_info):
+            if idx_i in to_delete:
+                continue
+            for idx_j, instance_j in enumerate(instances_info):
+                if idx_j <= idx_i:
+                    continue
+                if idx_j in to_delete:
+                    continue
+                
+                vox_idx_i = instance_i['vox_idx']
+                conf_per_pt_i = instance_i['conf_per_pt']
+                vox_idx_j = instance_j['vox_idx']
+                conf_per_pt_j = instance_j['conf_per_pt']
+                iou, iou_1, iou_2 = self.vox_idx_iou(vox_idx_i, vox_idx_j)
+                if iou > 0.25 or iou_1 > 0.5 or iou_2 > 0.5:
+                    # ver 2: delete the point with less views and less confidence
+                    to_delete_i = []
+                    for vox_i in conf_per_pt_i.keys():
+                        # keep points that are not in vox_idx_j
+                        if vox_i not in conf_per_pt_j:
+                            continue
+                        if len(conf_per_pt_i[vox_i]) < len(conf_per_pt_j[vox_i]):
+                            to_delete_i.append(vox_i)
+                        elif len(conf_per_pt_i[vox_i]) == len(conf_per_pt_j[vox_i]):
+                            if np.mean(conf_per_pt_i[vox_i]) < np.mean(conf_per_pt_j[vox_i]):
+                                to_delete_i.append(vox_i)
+                    to_delete_j = []
+                    for vox_j in conf_per_pt_j.keys():
+                        # keep points that are not in vox_idx_i
+                        if vox_j not in conf_per_pt_i:
+                            continue
+                        if len(conf_per_pt_j[vox_j]) < len(conf_per_pt_i[vox_j]):
+                            to_delete_j.append(vox_j)
+                        elif len(conf_per_pt_j[vox_j]) == len(conf_per_pt_i[vox_j]):
+                            if np.mean(conf_per_pt_j[vox_j]) < np.mean(conf_per_pt_i[vox_j]):
+                                to_delete_j.append(vox_j)
+                    
+                    # remove points in instance_i
+                    instance_i = self.del_partial_vox_idx(instance_i, to_delete_i)
+                    instance_j = self.del_partial_vox_idx(instance_j, to_delete_j)
+                
+                # immediately put instance to delete if it is too small
+                if len(instance_i['vox_idx']) < 1:
+                    to_delete.append(idx_i)
+                if len(instance_j['vox_idx']) < 1:
+                    to_delete.append(idx_j)
+
+        # Filter 2: filter certain instances used as background
+        for idx_i, instance_i in enumerate(instances_info):
+            if idx_i in to_delete:
+                continue
+            bg_name_ls = ['table']
+            if instance_i['label'] in bg_name_ls:
+                to_delete.append(idx_i)
+                continue
+        
+        # Filter 3: filter instances that are too small
+        for idx_i, instance_i in enumerate(instances_info):
+            if idx_i in to_delete:
+                continue
+            if len(instance_i['vox_idx']) < 1:
+                to_delete.append(idx_i)
+                continue
+        
+        for idx in sorted(to_delete, reverse=True):
+            del instances_info[idx]
+        
+        return instances_info
+    
+    def reorder_instances(self, instances_info, query_texts):
+        # reorder instances based on the query texts
+        new_instances_info = []
+        for query_text in ['background'] + query_texts:
+            for instance_info in instances_info:
+                if instance_info['label'] == query_text:
+                    new_instances_info.append(instance_info)
+        return new_instances_info
+
+    def swap_instance_mask(self, instances_info):
+        self.curr_obs_torch['mask'] = torch.zeros((self.num_cam, self.H, self.W), device=self.device, dtype=torch.uint8)
+        for i in range(self.num_cam):
+            new_mask = np.zeros_like(self.curr_obs_torch['mask_gs'][i][0], dtype=np.uint8)
+            for inst_idx, instance_info in enumerate(instances_info):
+                if i not in instance_info['idx']:
+                    continue
+                mask_idx = instance_info['idx'][i]
+                new_mask[self.curr_obs_torch['mask_gs'][i][mask_idx]] = inst_idx
+            self.curr_obs_torch['mask'][i] = torch.from_numpy(new_mask).to(device=self.device, dtype=torch.uint8)
+    
+    def align_instance_mask_v3(self, queries, boundaries, expected_labels=None):
+        self.iou_threshold = 0.005
+        instances_info = []
+        # each instance is a dict containing:
+        # - 'label': the label of the instance
+        # - 'pcd': a dict mapping from view idx to point cloud
+        # - 'conf': a dict mapping from view idx to confidence score
+        # - 'idx': a dict mapping from view idx to mask index in that view
+        lower_bound = np.array([boundaries['x_lower'], boundaries['y_lower'], boundaries['z_lower']])
+        higher_bound = np.array([boundaries['x_upper'], boundaries['y_upper'], boundaries['z_upper']])
+        voxel_size = 0.03
+        self.voxel_num = ((higher_bound - lower_bound) / voxel_size).astype(np.int32)
+        (
+            self.pcd_to_voxel,
+            self.voxel_to_pcd,
+            self.voxel_to_index,
+            self.index_to_voxel,
+            self.pcd_to_index,
+            self.index_to_pcd,
+        ) = _init_low_level_memory(
+            lower_bound, higher_bound, voxel_size, voxel_num=self.voxel_num
+        )
+        for i in range(self.num_cam):
+            instances_info = self.merge_instances_from_new_view_vox_ver(instances_info, i, boundaries)
+        instances_info = self.filter_instances_vox_ver(instances_info)
+        # TODO: add another function to adjust mask according to removed pcd
+        instances_info = self.reorder_instances(instances_info, queries)
+        self.swap_instance_mask(instances_info)
+        self.curr_obs_torch['consensus_mask_label'] = [instance_info['label'] for instance_info in instances_info]
+        if expected_labels is not None and self.curr_obs_torch['consensus_mask_label'] != expected_labels:
+            print('consensus mask label', self.curr_obs_torch['consensus_mask_label'])
     
     def align_with_prev_mask(self, mask):
         # :param new_mask: [num_cam, H, W, num_instance] torch tensor, the new detected mask
@@ -1593,47 +1109,49 @@ class Fusion():
         out_mask = out_mask.to(self.device, dtype=torch.uint8)
         return out_mask
     
-    # DEPRECATED
-    # def text_query_for_inst_mask(self, query, threshold, use_sam=False):
-    #     if 'color' not in self.curr_obs_torch:
-    #         print('Please call update() first!')
-    #         exit()
-        
-    #     if not self.xmem_first_mask_loaded:
-    #         query_mask = torch.zeros((self.num_cam, self.H, self.W), device=self.device)
-    #         for i in range(self.num_cam):
-    #             mask = grounded_instance_sam_np(self.curr_obs_torch['color'][i], query, self.ground_dino_model, self.sam_model, threshold)
-    #             query_mask[i] = mask
-    #         self.curr_obs_torch[f'mask_{query}'] = query_mask # [num_cam, H, W]
-    #         # align instance mask id to the first frame
-    #         self.align_instance_mask(query)
-    #         self.curr_obs_torch[f'mask_{query}'] = self.xmem_process(self.curr_obs_torch['color'], query_mask)
-    #     elif self.xmem_first_mask_loaded and not use_sam:
-    #         self.curr_obs_torch[f'mask_{query}'] = self.xmem_process(self.curr_obs_torch['color'], None) # [num_cam, H, W, num_instance]
-    #     elif self.xmem_first_mask_loaded and use_sam:
-    #         query_mask = torch.zeros((self.num_cam, self.H, self.W), device=self.device)
-    #         for i in range(self.num_cam):
-    #             mask = grounded_instance_sam_np(self.curr_obs_torch['color'][i], query, self.ground_dino_model, self.sam_model, threshold)
-    #             query_mask[i] = mask
-    #         query_mask = query_mask.to(torch.uint8)
-    #         query_mask = instance2onehot(query_mask, len(self.track_ids)) # [num_cam, H, W, num_instance]
-    #         query_mask = self.align_with_prev_mask(query_mask) # [num_cam, H, W, num_instance]
-    #         query_mask = onehot2instance(query_mask) # [num_cam, H, W]
-    #         self.curr_obs_torch[f'mask_{query}'] = self.xmem_process(self.curr_obs_torch['color'], query_mask) # [num_cam, H, W, num_instance]
-    #         # self.curr_obs_torch[f'mask_{query}'] = query_mask # [num_cam, H, W]
-    
-    def text_queries_for_inst_mask_no_track(self, queries, thresholds, merge_all = False):
-        query_mask = torch.zeros((self.num_cam, self.H, self.W), device=self.device)
+    def text_queries_for_inst_mask_no_track(self, queries, thresholds, boundaries, merge_all = False, expected_labels=None, robot_pcd=None):
+        masks = []
         labels = []
+        mask_confs = []
         for i in range(self.num_cam):
-            mask, label = grounded_instance_sam_bacth_queries_np(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all)
+            # mask, label = grounded_instance_sam_bacth_queries_np(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all)
+            mask, label, mask_conf = grounded_instance_sam_new_ver(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all, device=self.device)
+            
+            # filter out the mask close to robot_pcd
+            if robot_pcd is not None:
+                to_delete = []
+                for inst_i in range(mask.shape[0]):
+                    pose_i = self.curr_obs_torch['pose'][i].detach().cpu().numpy() # [3,4]
+                    pose_i = np.concatenate([pose_i, np.array([[0,0,0,1]])], axis=0) # [4,4]
+                    mask[inst_i] = rm_mask_close_to_pcd(depth=self.curr_obs_torch['depth'][i].detach().cpu().numpy(),
+                                            mask=mask[inst_i],
+                                            pcd=robot_pcd,
+                                            K=self.curr_obs_torch['K'][i].detach().cpu().numpy(),
+                                            pose=pose_i,)
+                    if mask[inst_i].sum() < 10:
+                        to_delete.append(inst_i)
+                mask = np.delete(mask, to_delete, axis=0)
+                for to_del_i in sorted(to_delete, reverse=True):
+                    del label[to_del_i]
+                mask_conf = np.delete(mask_conf, to_delete, axis=0)
+            
             labels.append(label)
-            query_mask[i] = mask
-        self.curr_obs_torch['mask'] = query_mask # [num_cam, H, W]
+            masks.append(mask)
+            mask_confs.append(mask_conf)
+        self.curr_obs_torch['mask_gs'] = masks # list of [num_obj, H, W]
         self.curr_obs_torch['mask_label'] = labels # [num_cam, ] list of list
+        self.curr_obs_torch['mask_conf'] = mask_confs # [num_cam, ] list of list
         _, idx = np.unique(labels[0], return_index=True)
         self.curr_obs_torch['semantic_label'] = list(np.array(labels[0])[np.sort(idx)]) # list of semantic label we have
-        # verfiy the assumption that the mask label is the same for all cameras
+        
+        # fig, axs = plt.subplots(4, 4 + 1, sharex=True, figsize=(20,20))
+        # for i in range(4):
+        #     axs[i, 0].imshow(self.curr_obs_torch['color'][i])
+        #     for j in range(4):
+        #         axs[i, j + 1].imshow(query_mask.detach().cpu().numpy()[i] == j)
+        # plt.show()
+        
+        # # verfiy the assumption that the mask label is the same for all cameras
         # for i in range(self.num_cam):
         #     try:
         #         assert self.curr_obs_torch['mask_label'][i] == self.curr_obs_torch['mask_label'][0]
@@ -1646,24 +1164,49 @@ class Fusion():
         #                 plt.imshow(self.curr_obs_torch['mask'][j].detach().cpu().numpy() == k)
         #             plt.show()
         #         raise AssertionError
+        
         # align instance mask id to the first frame
-        self.align_instance_mask_v2(queries)
-        self.curr_obs_torch[f'mask'] = instance2onehot(self.curr_obs_torch[f'mask'].to(torch.uint8), len(self.curr_obs_torch['consensus_mask_label'])).to(dtype=torch.float32)
+        print(self.curr_obs_torch['mask_label'])
+        self.align_instance_mask_v3(queries, boundaries, expected_labels)
+        self.curr_obs_torch[f'mask'] = instance2onehot(self.curr_obs_torch[f'mask'].to(torch.uint8), len(self.curr_obs_torch['consensus_mask_label'])).to(dtype=self.dtype)
     
-    def text_queries_for_inst_mask(self, queries, thresholds, use_sam=False, merge_all = False):
+    def text_queries_for_inst_mask(self, queries, thresholds, boundaries, use_sam=False, merge_all = False, expected_labels=None, robot_pcd=None):
         if 'color' not in self.curr_obs_torch:
             print('Please call update() first!')
             exit()
         
         if not self.xmem_first_mask_loaded:
-            query_mask = torch.zeros((self.num_cam, self.H, self.W), device=self.device)
+            masks = []
             labels = []
+            mask_confs = []
             for i in range(self.num_cam):
-                mask, label = grounded_instance_sam_bacth_queries_np(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all)
+                # mask, label = grounded_instance_sam_bacth_queries_np(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all)
+                mask, label, mask_conf = grounded_instance_sam_new_ver(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all, device=self.device)
+                
+                # filter out the mask close to robot_pcd
+                if robot_pcd is not None:
+                    to_delete = []
+                    for inst_i in range(mask.shape[0]):
+                        pose_i = self.curr_obs_torch['pose'][i].detach().cpu().numpy() # [3,4]
+                        pose_i = np.concatenate([pose_i, np.array([[0,0,0,1]])], axis=0) # [4,4]
+                        mask[inst_i] = rm_mask_close_to_pcd(depth=self.curr_obs_torch['depth'][i].detach().cpu().numpy(),
+                                             mask=mask[inst_i],
+                                             pcd=robot_pcd,
+                                             K=self.curr_obs_torch['K'][i].detach().cpu().numpy(),
+                                             pose=pose_i,)
+                        if mask[inst_i].sum() < 10:
+                            to_delete.append(inst_i)
+                    mask = np.delete(mask, to_delete, axis=0)
+                    for to_del_i in sorted(to_delete, reverse=True):
+                        del label[to_del_i]
+                    mask_conf = np.delete(mask_conf, to_delete, axis=0)
+                
                 labels.append(label)
-                query_mask[i] = mask
-            self.curr_obs_torch['mask'] = query_mask # [num_cam, H, W]
+                masks.append(mask)
+                mask_confs.append(mask_conf)
+            self.curr_obs_torch['mask_gs'] = masks # list of [num_obj, H, W]
             self.curr_obs_torch['mask_label'] = labels # [num_cam, ] list of list
+            self.curr_obs_torch['mask_conf'] = mask_confs # [num_cam, ] list of list
             _, idx = np.unique(labels[0], return_index=True)
             self.curr_obs_torch['semantic_label'] = list(np.array(labels[0])[np.sort(idx)]) # list of semantic label we have
             
@@ -1690,22 +1233,68 @@ class Fusion():
             
             # align instance mask id to the first frame
             print(self.curr_obs_torch['mask_label'])
-            self.align_instance_mask_v2(queries)
-            self.curr_obs_torch[f'mask'] = self.xmem_process(self.curr_obs_torch['color'], self.curr_obs_torch['mask'])
+            self.align_instance_mask_v3(queries, boundaries, expected_labels)
+            self.curr_obs_torch[f'mask'] = self.xmem_process(self.curr_obs_torch['color'], self.curr_obs_torch['mask']).to(dtype=self.dtype)
         elif self.xmem_first_mask_loaded and not use_sam:
-            self.curr_obs_torch[f'mask'] = self.xmem_process(self.curr_obs_torch['color'], None) # [num_cam, H, W, num_instance]
+            self.curr_obs_torch[f'mask'] = self.xmem_process(self.curr_obs_torch['color'], None).to(dtype=self.dtype) # [num_cam, H, W, num_instance]
         elif self.xmem_first_mask_loaded and use_sam:
+            raise NotImplementedError
             query_mask = torch.zeros((self.num_cam, self.H, self.W), device=self.device)
+            mask_confs = []
             for i in range(self.num_cam):
-                mask, label = grounded_instance_sam_bacth_queries_np(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all)
+                # mask, label = grounded_instance_sam_bacth_queries_np(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all)
+                mask, label, mask_conf = grounded_instance_sam_new_ver(self.curr_obs_torch['color'][i], queries, self.ground_dino_model, self.sam_model, thresholds, merge_all)
                 query_mask[i] = mask
+                mask_confs.append(mask_conf)
                 # labels.append(label)
             query_mask = query_mask.to(torch.uint8)
             query_mask = instance2onehot(query_mask, len(self.track_ids)) # [num_cam, H, W, num_instance]
             query_mask = self.align_with_prev_mask(query_mask) # [num_cam, H, W, num_instance]
             query_mask = onehot2instance(query_mask) # [num_cam, H, W]
-            self.curr_obs_torch[f'mask'] = self.xmem_process(self.curr_obs_torch['color'], query_mask) # [num_cam, H, W, num_instance]
+            self.curr_obs_torch[f'mask'] = self.xmem_process(self.curr_obs_torch['color'], query_mask).to(dtype=self.dtype) # [num_cam, H, W, num_instance]
+            self.curr_obs_torch[f'mask_conf'] = mask_confs
             # self.curr_obs_torch[f'mask'] = query_mask # [num_cam, H, W]
+    
+    def get_inst_num(self):
+        # NOTE: including the background
+        return len(self.curr_obs_torch['consensus_mask_label'])
+    
+    def extract_masked_pcd(self, inst_idx_ls, boundaries=None):
+        # extract point cloud of the object instance with index inst_idx
+        color = self.curr_obs_torch['color']
+        depth = self.curr_obs_torch['depth'].detach().cpu().numpy()
+        mask = self.curr_obs_torch['mask'].detach().cpu().numpy()
+        sel_mask = np.zeros(mask.shape[:3]).astype(bool)
+        for inst_idx in inst_idx_ls:
+            sel_mask = sel_mask | mask[..., inst_idx].astype(bool)
+        for i in range(self.num_cam):
+            sel_mask[i] = (cv2.erode((sel_mask[i] * 255).astype(np.uint8), np.ones([2, 2], np.uint8), iterations=1) / 255).astype(bool)
+        K = self.curr_obs_torch['K'].detach().cpu().numpy()
+        pose = self.curr_obs_torch['pose'].detach().cpu().numpy() # [num_cam, 3, 4]
+        pad = np.tile(np.array([[[0,0,0,1]]]), [pose.shape[0], 1, 1])
+        pose = np.concatenate([pose, pad], axis=1)
+        pcd, _ = aggr_point_cloud_from_data(color, depth, K, pose, downsample=False, masks=sel_mask, out_o3d=False, boundaries=boundaries)
+        return pcd
+    
+    def extract_masked_pcd_in_views(self, inst_idx_ls, view_idx_ls, boundaries, downsample=True):
+        assert len(view_idx_ls) == 1
+        # extract point cloud of the object instance with index inst_idx
+        color = self.curr_obs_torch['color'][view_idx_ls]
+        depth = self.curr_obs_torch['depth'].detach().cpu().numpy()[view_idx_ls]
+        mask = np.stack([self.curr_obs_torch['mask_gs'][view_idx] for view_idx in view_idx_ls], axis=0).transpose(0, 2, 3, 1) # [num_view, H, W, num_inst]
+        K = self.curr_obs_torch['K'].detach().cpu().numpy()[view_idx_ls]
+        pose = self.curr_obs_torch['pose'].detach().cpu().numpy()[view_idx_ls]
+        # if len(mask.shape) == 3:
+        #     mask = instance2onehot(mask.astype(np.uint8))
+        sel_mask = np.zeros(mask.shape[:3]).astype(bool)
+        for inst_idx in inst_idx_ls:
+            sel_mask = sel_mask | mask[..., inst_idx].astype(bool)
+        for view_idx in range(sel_mask.shape[0]):
+            sel_mask[view_idx] = (cv2.erode((sel_mask[view_idx] * 255).astype(np.uint8), np.ones([2, 2], np.uint8), iterations=1) / 255).astype(bool)
+        pad = np.tile(np.array([[[0,0,0,1]]]), [pose.shape[0], 1, 1])
+        pose = np.concatenate([pose, pad], axis=1)
+        pcd, _ = aggr_point_cloud_from_data(color, depth, K, pose, downsample=downsample, masks=sel_mask, out_o3d=False, boundaries=boundaries)
+        return pcd
     
     def get_query_obj_pcd(self):
         color = self.curr_obs_torch['color']
@@ -1720,171 +1309,6 @@ class Fusion():
         pose = np.concatenate([pose, pad], axis=1)
         pcd = aggr_point_cloud_from_data(color, depth, K, pose, downsample=False, masks=mask)
         return pcd
-    
-    def vis_3d(self, pts, res, params):
-        # :param pts: (N, 3) torch tensor in world frame
-        # :param res: dict contains:
-        #             - 'dist': (N) torch tensor, dist to the closest point on the surface
-        #             - 'dino_feats': (N, f) torch tensor, the features of the points
-        #             - 'query_masks': (N, nq) torch tensor, the query masks of the points
-        #             - 'valid_mask': (N) torch tensor, whether the point is valid
-        # :param params: dict for other useful params
-        
-        pts = pts[res['valid_mask']].cpu().numpy()
-        dist = res['dist'][res['valid_mask']].cpu().numpy()
-        # visualize dist
-        dist_vol = go.Figure(data=[go.Scatter3d(x=pts[:,0],
-                                                y=pts[:,1],
-                                                z=pts[:,2],
-                                                mode='markers',
-                                                marker=dict(
-                                                    size=2,
-                                                    color=dist,
-                                                    colorscale='Viridis',
-                                                    colorbar=dict(thickness=20, ticklen=4),))],
-                             layout=go.Layout(scene=dict(aspectmode='data'),))
-        dist_vol.show()
-        
-        # # visualize features
-        # features = res['dino_feats'][res['valid_mask']].cpu().numpy()
-        # pca = params['pca']
-        # features_pca = pca.transform(features)
-        # for i in range(features_pca.shape[1]):
-        #     features_pca[:, i] = (features_pca[:, i] - features_pca[:, i].min()) / (features_pca[:, i].max() - features_pca[:, i].min())
-        # features_pca = (features_pca * 255).astype(np.uint8)
-        # colors = []
-        # for i in range(0, features_pca.shape[0], 1):
-        #     colors.append(f'rgb({features_pca[i, 0]}, {features_pca[i, 1]}, {features_pca[i, 2]})')
-        # features_vol = go.Figure(data=[go.Scatter3d(x=pts[:,0],
-        #                                             y=pts[:,1],
-        #                                             z=pts[:,2],
-        #                                             mode='markers',
-        #                                             marker=dict(
-        #                                                 size=2,
-        #                                                 color=colors,
-        #                                                 colorbar=dict(thickness=20, ticklen=4),))],
-        #                          layout=go.Layout(scene=dict(aspectmode='data'),))
-        # features_vol.show()
-        
-        # # visualize masks
-        # query_masks = res['query_masks'][res['valid_mask']].cpu().numpy()
-        # NQ = res['query_masks'].shape[-1]
-        # for i in range(NQ):
-        #     mask_vol = go.Figure(data=[go.Scatter3d(x=pts[:,0],
-        #                                             y=pts[:,1],
-        #                                             z=pts[:,2],
-        #                                             mode='markers',
-        #                                             marker=dict(
-        #                                                 size=2,
-        #                                                 color=query_masks[:,i],
-        #                                                 colorscale='Viridis',
-        #                                                 colorbar=dict(thickness=20, ticklen=4),))],
-        #                          layout=go.Layout(scene=dict(aspectmode='data'),))
-        #     mask_vol.show()
-    
-    # visualize 3d field
-    def interactive_corr(self, src_info, tgt_info, pts, res):
-        # :param src_info: dict contains:
-        #                  - 'color': (H, W, 3) np array, color image
-        #                  - 'dino_feats': (H, W, f) torch tensor, dino features
-        # :param tgt_info: dict contains:
-        #                  - 'color': (K, H, W, 3) np array, color image
-        #                  - 'pose': (K, 3, 4) torch tensor, pose of the camera
-        #                  - 'K': (K, 3, 3) torch tensor, camera intrinsics
-        # :param pts: (N, 3) torch tensor in world frame
-        # :param res: dict contains:
-        #             - 'dist': (N) torch tensor, dist to the closest point on the surface
-        #             - 'dino_feats': (N, f) torch tensor, the features of the points
-        #             - 'query_masks': (N, nq) torch tensor, the query masks of the points
-        #             - 'valid_mask': (N) torch tensor, whether the point is valid
-        num_tgt = len(tgt_info['color'])
-        sim_scale = 0.05
-        imshow_scale = 0.6
-        
-        viridis_cmap = cm.get_cmap('viridis')
-        
-        def drawHeatmap(event, x, y, flags, param):
-            if event == cv2.EVENT_MOUSEMOVE:
-                src_color_render_curr = draw_keypoints(src_info['color'], np.array([[x, y]]), colors=[(255, 0, 0)], radius=5)
-                cv2.imshow('src', src_color_render_curr[..., ::-1])
-                src_feat_tensor = src_info['dino_feats'][y, x]
-                tgt_feat_sims_tensor = compute_similarity_tensor(res['dino_feats'], src_feat_tensor, scale=sim_scale, dist_type='l2') # [N]
-                tgt_feat_sims_tensor = (tgt_feat_sims_tensor - tgt_feat_sims_tensor.min()) / (tgt_feat_sims_tensor.max() - tgt_feat_sims_tensor.min()) # [N]
-                tgt_feat_sims = tgt_feat_sims_tensor.detach().cpu().numpy()
-                tgt_feat_sim_imgs = (viridis_cmap(tgt_feat_sims)[..., :3] * 255)[..., ::-1]
-                
-                pts_2d, _, _ = project_points_coords(pts, tgt_info['pose'], tgt_info['K']) # [N, 2]
-                pts_2d = pts_2d.detach().cpu().numpy()
-                pts_2d = pts_2d[..., ::-1]
-                
-                max_sim_idx = tgt_feat_sims_tensor.argmax()
-                match_pt_3d = pts[max_sim_idx][None]
-                match_pt_2d, _, _ = project_points_coords(match_pt_3d, tgt_info['pose'], tgt_info['K'])
-                match_pt_2d = match_pt_2d.detach().cpu().numpy()
-                
-                merge_imgs = []
-                
-                for idx in range(num_tgt):
-                    heatmap = np.zeros_like(tgt_info['color'][idx])
-                    heatmap = heatmap.reshape(self.H * self.W, 3)
-                    pts_2d_i = pts_2d[idx].astype(np.int32)
-                    valid_pts = (pts_2d_i[:, 0] >= 0) & (pts_2d_i[:, 0] < self.W) & (pts_2d_i[:, 1] >= 0) & (pts_2d_i[:, 1] < self.H)
-                    pts_2d_flat_idx = np.ravel_multi_index(pts_2d_i[valid_pts].T, (self.H, self.W))
-                    heatmap[pts_2d_flat_idx] = tgt_feat_sim_imgs[valid_pts]
-                    heatmap = heatmap.reshape(self.H, self.W, 3).astype(np.uint8)
-                    cv2.imshow(f'tgt_heatmap_{idx}', heatmap)
-                    
-                    tgt_imshow_curr = draw_keypoints(tgt_info['color'][idx], match_pt_2d[idx], colors=[(255, 0, 0)], radius=5)
-                    # cv2.imshow(f'tgt_{idx}', tgt_imshow_curr[..., ::-1])
-                    
-                    merge_img = np.concatenate([heatmap, tgt_imshow_curr[..., ::-1]], axis=1)
-                    merge_imgs.append(merge_img)
-                    
-                merge_imgs = np.concatenate(merge_imgs, axis=0)
-                merge_imgs = cv2.resize(merge_imgs, (int(merge_imgs.shape[1] * imshow_scale), int(merge_imgs.shape[0] * imshow_scale)), interpolation=cv2.INTER_NEAREST)
-                cv2.imshow('merge', merge_imgs)
-                
-        cv2.imshow('src', src_info['color'][..., ::-1])
-        # for idx in range(num_tgt):
-        #     cv2.imshow(f'tgt_{idx}', tgt_info['color'][idx][..., ::-1])
-        
-        cv2.setMouseCallback('src', drawHeatmap)
-        
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-    def interactive_corr_img(self, src_info, tgt_info):
-        src_img = src_info['color'][..., ::-1]
-        src_dino = src_info['dino_feats']
-        
-        tgt_img = tgt_info['color'][..., ::-1]
-        tgt_dino = tgt_info['dino_feats'][None].permute(0, 3, 1, 2)
-        
-        viridis_cmap = cm.get_cmap('viridis')
-        
-        def drawHeatmap(event, x, y, flags, param):
-            # feat_x = int(x / src_img.shape[1] * src_dino.shape[1])
-            # feat_y = int(y / src_img.shape[0] * src_dino.shape[0])
-            if event == cv2.EVENT_MOUSEMOVE:
-                src_img_curr = draw_keypoints(src_img, np.array([[x, y]]), colors=[(255, 0, 0)], radius=5)
-                cv2.imshow('src', src_img_curr)
-                src_feat = src_dino[y, x]
-                tgt_feat_sim = compute_similarity_tensor(tgt_dino, src_feat, scale=0.5, dist_type='l2')[0].detach().cpu().numpy()
-                tgt_feat_sim = (tgt_feat_sim - tgt_feat_sim.min()) / (tgt_feat_sim.max() - tgt_feat_sim.min())
-                tgt_feat_sim_img = (viridis_cmap(tgt_feat_sim)[..., :3] * 255)[..., ::-1]
-                # tgt_feat_sim_img = cv2.resize(tgt_feat_sim_img, (tgt_img.shape[1], tgt_img.shape[0]), interpolation=cv2.INTER_NEAREST)
-                tgt_color_render_curr = (tgt_feat_sim_img * tgt_feat_sim[..., None] + tgt_img * (1.0 - tgt_feat_sim[..., None])).astype(np.uint8)
-                cv2.imshow(f'tgt', tgt_color_render_curr)
-                cv2.imshow(f'heatmap', tgt_feat_sim_img.astype(np.uint8))
-                # cv2.imshow(f'tgt_{idx}', tgt_feat_sim_img.astype(np.uint8))
-        
-        cv2.imshow('src', src_img)
-        cv2.imshow('tgt', tgt_img)
-
-        cv2.setMouseCallback('src', drawHeatmap)
-        
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
     
     def extract_mesh(self, pts, res, grid_shape):
         # :param pts: (N, 3) torch tensor in world frame
@@ -1905,38 +1329,6 @@ class Fusion():
         
         return vertices_coords, triangles
     
-    def extract_meshes(self, pts, res, grid_shape):
-        # :param pts: (N, 3) torch tensor in world frame
-        # :param res: dict contains:
-        #             - 'dist': (N) torch tensor, dist to the closest point on the surface
-        #             - 'mask': (N, nq) torch tensor, the query masks of the points
-        #             - 'valid_mask': (N) torch tensor, whether the point is valid
-        # :param grid_shape: (3) tuple, the shape of the grid
-        vertices_list = []
-        triangles_list = []
-        mask_label = self.curr_obs_torch['mask_label'][0]
-        num_instance = len(mask_label)
-        
-        mask = res['mask']
-        mask = mask / (mask.sum(dim=1, keepdim=True) + 1e-7) # (N, num_instances)
-        for i in range(num_instance):
-            mask_i = mask[:, i] > 0.6
-            dist = res['dist'].clone()
-            dist[~mask_i] = 1e3
-            dist = dist.detach().cpu().numpy()
-            dist = dist.reshape(grid_shape)
-            smoothed_dist = mcubes.smooth(dist)
-            vertices, triangles = mcubes.marching_cubes(smoothed_dist, 0)
-            vertices = vertices.astype(np.int32)
-            # vertices_flat = np.unravel_index(vertices, grid_shape)
-            vertices_flat = np.ravel_multi_index(vertices.T, grid_shape)
-            vertices_coords = pts.detach().cpu().numpy()[vertices_flat]
-            
-            vertices_list.append(vertices_coords)
-            triangles_list.append(triangles)
-        
-        return vertices_list, triangles_list
-
     def create_mask_mesh(self, vertices, triangles, res):
         # :param vertices: (N, 3) numpy array, the vertices of the mesh
         # :param triangles: (M, 3) numpy array, the triangles of the mesh
@@ -2023,55 +1415,6 @@ class Fusion():
         color_mesh = trimesh.Trimesh(vertices=vertices, faces=triangles[..., ::-1], vertex_colors=colors)
         return color_mesh
     
-    def select_features(self, color, params):
-        H, W = color.shape[:2]
-        features = self.extract_features(color[None], params)
-        features = F.interpolate(features.permute(0, 3, 1, 2),
-                                 size=color.shape[:2],
-                                 mode='bilinear',
-                                 align_corners=True).permute(0, 2, 3, 1)[0]
-        
-        param = {'src_pts': []} # (col, row)
-        
-        color_cands = [(180,119,31),
-                       (14,127,255),
-                       (44,160,44),
-                       (40,39,214),
-                       (189,103,148),]
-        
-        def select_kypts(event,x,y,flags,param):
-            if event == cv2.EVENT_LBUTTONDBLCLK:
-                param['src_pts'].append([x, y])
-                color_curr = draw_keypoints(color, np.array([[x, y]]), colors=[(0, 0, 255)], radius=5)
-                cv2.imshow('src', color_curr[..., ::-1])
-            elif event == cv2.EVENT_MOUSEMOVE:
-                color_curr = draw_keypoints(color, np.array([[x, y]]), colors=[(255, 0, 0)], radius=5)
-                for kp in param['src_pts']:
-                    color_curr = draw_keypoints(color_curr, np.array([kp]), colors=[(0, 0, 255)], radius=5)
-                cv2.imshow('src', color_curr[..., ::-1])
-        
-        cv2.imshow('src', color[..., ::-1])
-        cv2.setMouseCallback('src', select_kypts, param)
-        
-        key = cv2.waitKey(0)
-        if key == ord('q'):
-            cv2.destroyAllWindows()
-        
-        src_feats = [features[p[1], p[0]] for p in param['src_pts']]
-        src_feats = torch.stack(src_feats)
-        
-        N = src_feats.shape[0]
-        try:
-            assert N <= len(color_cands)
-            colors = color_cands[:N]
-        except:
-            print('not enough color candidates')
-            return
-        color_with_kypts = color.copy()
-        color_with_kypts = draw_keypoints(color_with_kypts, np.array(param['src_pts']), colors=colors, radius=int(5 * H / 360))
-        
-        return src_feats, color_with_kypts
-    
     def select_features_rand(self, boundaries, N, per_instance=False, res = None, init_idx = -1):
         # randomly select N features for object {query_text} in 3D space 
         res = 0.001 if res is None else res
@@ -2127,6 +1470,68 @@ class Fusion():
             img = draw_keypoints(img, sample_pts_2d, colors, radius=5)
             img_list.append(img)
             last_label = label[i]
+        
+        del out
+        return src_feats_list, src_pts_list, img_list
+    
+    def select_features_from_pcd(self, pcd, N, per_instance=False, init_idx = -1, vis = False):
+        # pcd: (N, 3) numpy array
+        dist_threshold = 0.005
+        
+        pcd_tensor = torch.from_numpy(pcd).to(self.device, dtype=self.dtype)
+        
+        with torch.no_grad():
+            out = self.batch_eval(pcd_tensor, return_names=['mask'])
+        
+        dist_mask = torch.abs(out['dist']) < dist_threshold
+        
+        label = self.curr_obs_torch['consensus_mask_label']
+        
+        last_label = label[0]
+        
+        src_feats_list = []
+        img_list = []
+        src_pts_list = []
+        mask = out['mask'] # (N, num_instances) where 0 is background
+        mask = mask / (mask.sum(dim=1, keepdim=True) + 1e-7) # (N, num_instances)
+        for i in range(1, len(label)):
+            if label[i] == last_label and not per_instance:
+                continue
+            instance_mask = mask[:, i] > 0.6
+            masked_pts = pcd_tensor[instance_mask & dist_mask & out['valid_mask']]
+            if masked_pts.shape[0] == 0:
+                continue
+            
+            sample_pts, sample_idx, _ = fps_np(masked_pts.detach().cpu().numpy(), N, init_idx=init_idx)
+            # src_feats_list.append(out['dino_feats'][sample_idx])
+            src_feats_list.append(self.eval(torch.from_numpy(sample_pts).to(self.device, self.dtype))['dino_feats'])
+            src_pts_list.append(sample_pts)
+            
+            last_label = label[i]
+            
+            if not vis:
+                continue
+            
+            num_pts = sample_pts.shape[0]
+            pose = self.curr_obs_torch['pose'][0].detach().cpu().numpy()
+            K = self.curr_obs_torch['K'][0].detach().cpu().numpy()
+            fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+            img = self.curr_obs_torch['color'][0]
+            
+            cmap = cm.get_cmap('viridis')
+            colors = ((cmap(np.linspace(0, 1, num_pts))[:, :3]) * 255).astype(np.int32)
+            
+            sample_pts = np.concatenate([sample_pts, np.ones([num_pts, 1])], axis=-1) # [num_pts, 4]
+            sample_pts = np.matmul(pose, sample_pts.T)[:3].T # [num_pts, 3]
+            
+            sample_pts_2d = sample_pts[:, :2] / sample_pts[:, 2:] # [num_pts, 2]
+            sample_pts_2d[:, 0] = sample_pts_2d[:, 0] * fx + cx
+            sample_pts_2d[:, 1] = sample_pts_2d[:, 1] * fy + cy
+            
+            sample_pts_2d = sample_pts_2d.astype(np.int32)
+            sample_pts_2d = sample_pts_2d.reshape(num_pts, 2)
+            img = draw_keypoints(img, sample_pts_2d, colors, radius=5)
+            img_list.append(img)
         
         del out
         return src_feats_list, src_pts_list, img_list
@@ -2199,566 +1604,6 @@ class Fusion():
             last_label = label[i]
 
         return src_feats_list, src_pts_list, img_list
-    
-    # DEPRECATED: does not use mask information
-    # def find_correspondences(self, src_feats, pts, res):
-    #     # :param src_feats: (K, f) torch tensor
-    #     # :param pts: (N, 3) torch tensor in world frame
-    #     # :param res: dict contains:
-    #     #             - 'dist': (N) torch tensor, dist to the closest point on the surface
-    #     #             - 'dino_feats': (N, f) torch tensor, the features of the points
-    #     #             - 'valid_mask': (N) torch tensor, whether the point is valid
-    #     tgt_feats = res['dino_feats'][res['valid_mask']] # (N', f)
-    #     pts = pts[res['valid_mask']] # (N', 3)
-        
-    #     sim_tensor = compute_similarity_tensor_multi(tgt_feats[None].permute(0, 2, 1),
-    #                                                  src_feats,
-    #                                                  scale = 0.5,
-    #                                                  dist_type='l2') # (1, K, N')
-    #     sim_tensor = sim_tensor[0].permute(1, 0) # (N', K)
-    #     match_pts, conf = extract_kypts_gpu(sim_tensor, pts, match_metric='sum') # (K, 3)
-    #     return match_pts, conf
-    
-    # DEPRECATED: only support one category
-    # def find_correspondences_with_mask(self, src_feats, pts, res, debug=False, debug_info=None):
-    #     # :param src_feats: (K, f) torch tensor
-    #     # :param pts: (num_instances - 1, K, 3) torch tensor in world frame
-    #     # :param res: dict contains:
-    #     #             - 'dist': (N) torch tensor, dist to the closest point on the surface
-    #     #             - 'dino_feats': (N, f) torch tensor, the features of the points
-    #     #             - 'mask_*': (N, num_instances) torch tensor, whether the point is in the instance
-    #     #             - 'valid_mask': (N) torch tensor, whether the point is valid
-    #     mask = res['mask_shoe'] # (N, num_instances) where 0 is background
-    #     mask = mask / (mask.sum(dim=1, keepdim=True) + 1e-7) # (N, num_instances)
-    #     # mask_onehot = torch.argmax(mask, dim=1).to(torch.uint8) # (N,)
-    #     # mask = instance2onehot(mask_onehot) # (N, num_instances)
-    #     num_instances = mask.shape[1]
-    #     match_pts_list = []
-    #     for i in range(1, num_instances):
-    #         # instance_mask = mask[:, i]
-    #         instance_mask = mask[:, i] > 0.6
-    #         tgt_feats = res['dino_feats'][res['valid_mask'] & instance_mask] # (N', f)
-    #         pts_i = pts[res['valid_mask'] & instance_mask] # (N', 3)
-    #         # tgt_feats = res['dino_feats'][res['valid_mask']] # (N', f)
-    #         # pts_i = pts[res['valid_mask']] # (N', 3)
-    #         instance_mask = instance_mask[res['valid_mask']] # (N', )
-            
-    #         if debug:
-    #             pts_i_np = pts_i.cpu().numpy()
-    #             full_pts = debug_info['full_pts']
-    #             full_mask = debug_info['full_mask']
-    #             full_pts_1 = full_pts[full_mask[:, 1].astype(bool)]
-    #             full_pts_2 = full_pts[full_mask[:, 2].astype(bool)]
-    #             vol = go.Figure(data=[go.Scatter3d(x=pts_i_np[:,0],
-    #                                                     y=pts_i_np[:,1],
-    #                                                     z=pts_i_np[:,2],
-    #                                                     mode='markers',
-    #                                                     marker=dict(
-    #                                                         size=2,
-    #                                                         colorscale='Viridis',
-    #                                                         colorbar=dict(thickness=20, ticklen=4),)),
-    #                                   go.Scatter3d(x=full_pts_1[:,0],
-    #                                                y=full_pts_1[:,1],
-    #                                                z=full_pts_1[:,2],
-    #                                                mode='markers',
-    #                                                marker=dict(
-    #                                                    size=2,
-    #                                                    colorscale='Viridis',
-    #                                                    colorbar=dict(thickness=20, ticklen=4),)),
-    #                                   go.Scatter3d(x=full_pts_2[:,0],
-    #                                                y=full_pts_2[:,1],
-    #                                                z=full_pts_2[:,2],
-    #                                                mode='markers',
-    #                                                marker=dict(
-    #                                                    size=2,
-    #                                                    colorscale='Viridis',
-    #                                                    colorbar=dict(thickness=20, ticklen=4),))],
-    #                                     layout=go.Layout(scene=dict(aspectmode='data'),))
-    #             vol.show()
-            
-    #         sim_tensor = compute_similarity_tensor_multi(tgt_feats[None].permute(0, 2, 1),
-    #                                                     src_feats,
-    #                                                     scale = 0.5,
-    #                                                     dist_type='l2') # (1, K, N')
-    #         sim_tensor = sim_tensor[0].permute(1, 0) # (N', K)
-    #         # sim_tensor = sim_tensor * torch.clamp_min(torch.log(instance_mask[:, None] + 1e-7) + 1, 0) # (N', K)
-    #         match_pts = extract_kypts_gpu(sim_tensor, pts_i, match_metric='sum') # (K, 3)
-    #         match_pts_list.append(match_pts)
-    #     match_pts = torch.stack(match_pts_list, dim=0) # (num_instances - 1, K, 3)
-    #     return match_pts
-    
-    def compute_conf(self, matched_pts, tgt_feats, conf_sigma):
-        # :param matched_pts: (K, 3) torch tensor
-        # :param tgt_feats: (K, f) torch tensor
-        # :return conf: (K, ) torch tensor
-        # matched_pts_eval = self.eval(matched_pts, return_names=['dino_feats'], return_inter=True)
-        matched_pts_eval = self.eval(matched_pts, return_names=['dino_feats'])
-        feat_dist = torch.norm(matched_pts_eval['dino_feats'] - tgt_feats, dim=1) # (K, )
-        # inter_feat = matched_pts_eval['dino_feats_inter'] # (num_view, K, f)
-        # inter_feat_dist = torch.norm(inter_feat - tgt_feats[None], dim=2) # (num_view, K)
-        # inter_feat_conf = torch.exp(-inter_feat_dist / conf_sigma) # (num_view, K)
-        # for i in range(inter_feat_conf.shape[0]):
-        #     print(f'conf in view {i}: {inter_feat_conf[i,0].item()}')
-        conf = torch.exp(-feat_dist / conf_sigma) * torch.exp(-torch.abs(matched_pts_eval['dist']) * 50) * matched_pts_eval['valid_mask'] # (K, )
-        return conf
-    
-    def find_correspondences_with_mask(self,
-                                       src_feat_info,
-                                       pts,
-                                       last_match_pts_list,
-                                       res,
-                                       debug=False,
-                                       debug_info=None):
-        # :param src_feat_info dict
-        #        - key: 'object_name'
-        #        - value: dict contains:
-        #          - 'path': str, path to the image
-        #          - 'params': dict contains:
-        #            - 'patch_h': int, height of the patch
-        #            - 'patch_w': int, width of the patch
-        #            - 'sam_threshold': float, threshold for sam
-        #          - 'src_feats': [-1, f] torch tensor, features to track
-        # :param pts: (num_instances - 1, K, 3) torch tensor in world frame
-        # :param last_match_pts_list: list of (K, 3) numpy array
-        # :param res: dict contains:
-        #             - 'dist': (N) torch tensor, dist to the closest point on the surface
-        #             - 'dino_feats': (N, f) torch tensor, the features of the points
-        #             - 'mask_*': (N, num_instances) torch tensor, whether the point is in the instance
-        #             - 'valid_mask': (N) torch tensor, whether the point is valid
-        mask = res['mask'] # (N, num_instances) where 0 is background
-        mask = mask / (mask.sum(dim=1, keepdim=True) + 1e-7) # (N, num_instances)
-        # mask_onehot = torch.argmax(mask, dim=1).to(torch.uint8) # (N,)
-        # mask = instance2onehot(mask_onehot) # (N, num_instances)
-        num_instances = mask.shape[1]
-        match_pts_list = []
-        conf_list = []
-        for i in range(1, num_instances):
-            src_feats = src_feat_info[self.curr_obs_torch['mask_label'][0][i]]['src_feats']
-            if last_match_pts_list is None:
-                last_match_pts = None
-            else:
-                last_match_pts = torch.from_numpy(last_match_pts_list[i - 1]).to(self.device, dtype=torch.float32)
-            
-            # instance_mask = mask[:, i]
-            instance_mask = mask[:, i] > 0.6
-            tgt_feats = res['dino_feats'][res['valid_mask'] & instance_mask] # (N', f)
-            pts_i = pts[res['valid_mask'] & instance_mask] # (N', 3)
-            # tgt_feats = res['dino_feats'][res['valid_mask']] # (N', f)
-            # pts_i = pts[res['valid_mask']] # (N', 3)
-            instance_mask = instance_mask[res['valid_mask']] # (N', )
-            
-            if debug:
-                pts_i_np = pts_i.cpu().numpy()
-                full_pts = debug_info['full_pts']
-                full_mask = debug_info['full_mask']
-                full_pts_1 = full_pts[full_mask[:, 1].astype(bool)]
-                full_pts_2 = full_pts[full_mask[:, 2].astype(bool)]
-                vol = go.Figure(data=[go.Scatter3d(x=pts_i_np[:,0],
-                                                        y=pts_i_np[:,1],
-                                                        z=pts_i_np[:,2],
-                                                        mode='markers',
-                                                        marker=dict(
-                                                            size=2,
-                                                            colorscale='Viridis',
-                                                            colorbar=dict(thickness=20, ticklen=4),)),
-                                      go.Scatter3d(x=full_pts_1[:,0],
-                                                   y=full_pts_1[:,1],
-                                                   z=full_pts_1[:,2],
-                                                   mode='markers',
-                                                   marker=dict(
-                                                       size=2,
-                                                       colorscale='Viridis',
-                                                       colorbar=dict(thickness=20, ticklen=4),)),
-                                      go.Scatter3d(x=full_pts_2[:,0],
-                                                   y=full_pts_2[:,1],
-                                                   z=full_pts_2[:,2],
-                                                   mode='markers',
-                                                   marker=dict(
-                                                       size=2,
-                                                       colorscale='Viridis',
-                                                       colorbar=dict(thickness=20, ticklen=4),))],
-                                        layout=go.Layout(scene=dict(aspectmode='data'),))
-                vol.show()
-            
-            sim_tensor = compute_similarity_tensor_multi(tgt_feats,
-                                                        src_feats,
-                                                        pts_i,
-                                                        last_match_pts,
-                                                        scale = 0.5,
-                                                        dist_type='l2') # (N', K)
-            # sim_tensor = sim_tensor * torch.clamp_min(torch.log(instance_mask[:, None] + 1e-7) + 1, 0) # (N', K)
-            match_pts = extract_kypts_gpu(sim_tensor, pts_i, match_metric='sum') # (K, 3)
-            # print('stddev of x: ', pts_i[:,0].std().item())
-            # print('stddev of y: ', pts_i[:,1].std().item())
-            # print('stddev of z: ', pts_i[:,2].std().item())
-            # print('stddev:', pts_i.std(dim=0).norm().item())
-            topk_sim_idx = torch.topk(sim_tensor, k=1000, dim=0)[1] # (100, K)
-            topk_pts = pts_i[topk_sim_idx] # (100, K, 3)
-            observability = self.compute_conf(match_pts, src_feats, conf_sigma=1000.) # (K, )
-            stability = torch.exp(-topk_pts.std(dim=0).norm(dim=1) * 20.0) # (K, )
-            # print('stability:', stability)
-            # print('observability:', observability)
-            conf = observability * stability
-            match_pts_list.append(match_pts.detach().cpu().numpy())
-            conf_list.append(conf.detach().cpu().numpy())
-        # match_pts = torch.stack(match_pts_list, dim=0) # (num_instances - 1, K, 3)
-        return match_pts_list, conf_list
-    
-    def find_correspondences(self,
-                             src_feats,
-                             boundaries,
-                             instance_id,):
-        # :param src_feats torch.Tensor (K, f)
-        curr_res = 0.01
-        
-        curr_que_pts, grid_shape = create_init_grid(boundaries, curr_res)
-        curr_que_pts = curr_que_pts.to(self.device, dtype=torch.float32)
-        
-        out = self.eval(curr_que_pts, return_names=['dino_v2_feats', 'mask'])
-        # out = self.eval(curr_que_pts, return_names=['dino_v2_feats'])
-        
-        for i in range(3):
-            # multi-instance tracking
-            mask = out['mask'] # (N, num_instances) where 0 is background
-            mask = mask / (mask.sum(dim=1, keepdim=True) + 1e-7) # (N, num_instances)
-            # mask_onehot = torch.argmax(mask, dim=1).to(torch.uint8) # (N,)
-            # mask = instance2onehot(mask_onehot) # (N, num_instances)
-            curr_que_pts_list = []
-            mask_instance = mask[:, instance_id] > 0.6 # (N,)
-            try:
-                assert mask_instance.max() > 0
-            except:
-                print('no instance found!')
-                exit()
-            tgt_feats = out['dino_v2_feats'][out['valid_mask'] & mask_instance] # (N', f)
-            curr_valid_que_pts = curr_que_pts[out['valid_mask'] & mask_instance] # (N', 3)
-            assert tgt_feats.shape[0] == curr_valid_que_pts.shape[0]
-            sim_vol = compute_similarity_tensor_multi(tgt_feats,
-                                                    src_feats,
-                                                    None,
-                                                    None,
-                                                    scale = 0.5,
-                                                    dist_type='l2') # (N', K)
-            next_que_pts, next_res = octree_subsample(sim_vol,
-                                                    curr_valid_que_pts,
-                                                    curr_res,
-                                                    topK=200)
-            curr_que_pts_list.append(next_que_pts)
-            curr_res = next_res
-            del curr_que_pts
-            curr_que_pts = torch.cat(curr_que_pts_list, dim=0)
-            out_keys = list(out.keys())
-            for k in out_keys:
-                del out[k]
-            del out
-            out = self.batch_eval(curr_que_pts, return_names=['dino_v2_feats', 'mask'])
-        # src_feat_info = {
-        #     self.curr_obs_torch['mask_label'][0][instance_id]: {
-        #         'src_feats': src_feats,
-        #     }
-        # }
-        
-        mask = out['mask'] # (N, num_instances) where 0 is background
-        mask = mask / (mask.sum(dim=1, keepdim=True) + 1e-7) # (N, num_instances)
-        # src_feats = src_feat_info[self.curr_obs_torch['mask_label'][0][i]]['src_feats']
-
-        instance_mask = mask[:, instance_id] > 0.6
-        tgt_feats = out['dino_v2_feats'][out['valid_mask'] & instance_mask] # (N', f)
-        pts_i = curr_que_pts[out['valid_mask'] & instance_mask] # (N', 3)
-        instance_mask = instance_mask[out['valid_mask']] # (N', )
-        
-        sim_tensor = compute_similarity_tensor_multi(tgt_feats,
-                                                    src_feats,
-                                                    None,
-                                                    None,
-                                                    scale = 0.5,
-                                                    dist_type='l2') # (N', K)
-        # sim_tensor = sim_tensor * torch.clamp_min(torch.log(instance_mask[:, None] + 1e-7) + 1, 0) # (N', K)
-        match_pts = extract_kypts_gpu(sim_tensor, pts_i, match_metric='sum') # (K, 3)
-        
-        return match_pts
-
-    def tracking(self,
-                 src_feat_info,
-                 last_match_pts_list,
-                 boundaries,
-                 rand_ptcl_num):
-        # :param src_feat_info dict
-        # :param last_match_pts_list list of [rand_ptcl_num, 3] np.array, could be None if no previous match
-        
-        # debug = (sel_time >= 99999)
-        # if debug:
-        #     curr_res = 0.002
-            
-        #     init_grid, grid_shape = create_init_grid(boundaries, curr_res)
-        #     init_grid = init_grid.to(self.device, dtype=torch.float32)
-            
-        #     # out = self.eval(init_grid)
-        #     out = self.batch_eval(init_grid, return_names=[])
-            
-        #     # extract mesh
-        #     vertices, triangles = self.extract_mesh(init_grid, out, grid_shape)
-        #     # mcubes.export_obj(vertices, triangles, 'sphere.obj')
-        
-        #     mask = self.curr_obs_torch['mask'].cpu().numpy() # [num_view, H, W, NQ]
-        #     mask = onehot2instance(mask) # [num_view, H, W]
-        #     mask = mask / mask.max() # [num_view, H, W]
-        #     num_view, H, W = mask.shape
-        #     cmap = cm.get_cmap('jet')
-        #     mask_vis = cmap(mask.reshape(-1)).reshape(num_view, H, W, 4)[..., :3] # [num_view, H, W, 3]
-        #     mask_vis = (mask_vis * 255).astype(np.uint8)
-        #     merge_vis = np.concatenate([mask_vis[i] for i in range(mask_vis.shape[0])], axis=1)
-            
-        #     # eval mask and feature of vertices
-        #     vertices_tensor = torch.from_numpy(vertices).to(self.device, dtype=torch.float32)
-        #     out = self.batch_eval(vertices_tensor, return_names=['dino_feats', 'mask'])
-        #     # mask_meshes = self.create_mask_mesh(vertices, triangles, out)
-        #     mask_meshes = self.create_instance_mask_mesh(vertices, triangles, out)
-        #     full_mask = out['mask'].cpu().numpy() # [N, num_instances]
-        #     for mask_mesh in mask_meshes:
-        #         mask_mesh.show(smooth=True)
-            
-        #     plt.imshow(merge_vis)
-        #     plt.show()
-        #     # feature_mesh = self.create_descriptor_mesh(vertices, triangles, out, {'pca': pca})
-        #     # feature_mesh.show(smooth=True)
-        
-        curr_res = 0.01
-        
-        curr_que_pts, grid_shape = create_init_grid(boundaries, curr_res)
-        curr_que_pts = curr_que_pts.to(self.device, dtype=torch.float32)
-        
-        out = self.eval(curr_que_pts, return_names=['dino_feats', 'mask'])
-        # out = self.eval(curr_que_pts, return_names=['dino_feats'])
-        
-        for i in range(3):
-            
-            # multi-instance tracking
-            mask = out['mask'] # (N, num_instances) where 0 is background
-            mask = mask / (mask.sum(dim=1, keepdim=True) + 1e-7) # (N, num_instances)
-            # mask_onehot = torch.argmax(mask, dim=1).to(torch.uint8) # (N,)
-            # mask = instance2onehot(mask_onehot) # (N, num_instances)
-            curr_que_pts_list = []
-            for instance_id in range(1, mask.shape[1]):
-                src_feats = src_feat_info[self.curr_obs_torch['mask_label'][0][instance_id]]['src_feats'] # (K, f,)
-                # mask_instance = mask[:, instance_id] # (N,)
-                mask_instance = mask[:, instance_id] > 0.6 # (N,)
-                try:
-                    assert mask_instance.max() > 0
-                except:
-                    print('no instance found!')
-                    exit()
-                tgt_feats = out['dino_feats'][out['valid_mask'] & mask_instance] # (N', f)
-                curr_valid_que_pts = curr_que_pts[out['valid_mask'] & mask_instance] # (N', 3)
-                # tgt_feats = out['dino_feats'][out['valid_mask']] # (N', f)
-                # curr_valid_que_pts = curr_que_pts[out['valid_mask']] # (N', 3)
-                assert tgt_feats.shape[0] == curr_valid_que_pts.shape[0]
-                # mask_instance = mask[:, instance_id][out['valid_mask']] # (N',)
-                if last_match_pts_list is None:
-                    last_match_pts_i = None
-                else:
-                    last_match_pts_i = torch.from_numpy(last_match_pts_list[instance_id - 1]).to(self.device, dtype=torch.float32) # (K, 3)
-                sim_vol = compute_similarity_tensor_multi(tgt_feats,
-                                                        src_feats,
-                                                        curr_valid_que_pts,
-                                                        last_match_pts_i,
-                                                        scale = 0.5,
-                                                        dist_type='l2') # (N', K)
-                # sim_vol = sim_vol * mask_instance[:, None] # (N', K) # weighted using mask
-                # sim_vol = sim_vol * torch.clamp_min(torch.log(mask_instance[:, None] + 1e-7) + 1, 0)
-                next_que_pts, next_res = octree_subsample(sim_vol,
-                                                        curr_valid_que_pts,
-                                                        curr_res,
-                                                        topK=1000)
-                curr_que_pts_list.append(next_que_pts)
-            curr_res = next_res
-            del curr_que_pts
-            curr_que_pts = torch.cat(curr_que_pts_list, dim=0)
-            out_keys = list(out.keys())
-            for k in out_keys:
-                del out[k]
-            del out
-            out = self.batch_eval(curr_que_pts, return_names=['dino_feats', 'mask'])
-            
-            # DEPRECATED: single-instance tracking
-            # tgt_feats = out['dino_feats'][out['valid_mask']] # (N', f)
-            # curr_valid_que_pts = curr_que_pts[out['valid_mask']] # (N', 3)
-            # assert tgt_feats.shape[0] == curr_valid_que_pts.shape[0]
-    
-            # sim_vol = compute_similarity_tensor_multi(tgt_feats[None].permute(0, 2, 1),
-            #                                           src_feats,
-            #                                           scale = 0.5,
-            #                                           dist_type='l2')[0].permute(1, 0) # (N', K)
-            # curr_que_pts, curr_res = octree_subsample(sim_vol,
-            #                                           curr_valid_que_pts,
-            #                                           curr_res,
-            #                                           topK=1000)
-            # out = self.eval(curr_que_pts, return_names=['dino_feats'])
-        
-        # match_pts = self.find_correspondences(src_feats, curr_que_pts, out).detach().cpu().numpy()
-        # if debug:
-        #     debug_info = {'full_pts': vertices,
-        #                 'full_mask': full_mask,}
-        # else:
-        #     debug_info = None
-        match_pts_list, conf_list = self.find_correspondences_with_mask(src_feat_info,
-                                                                curr_que_pts,
-                                                                last_match_pts_list,
-                                                                out,
-                                                                debug=False,
-                                                                debug_info=None)
-        semantic_conf_list = []
-        for semantic_label in self.curr_obs_torch['semantic_label'][1:]:
-            instance_indices = find_indices(self.curr_obs_torch['mask_label'][0], semantic_label)
-            semantic_conf = np.zeros(rand_ptcl_num)
-            for instance_idx in instance_indices:
-                semantic_conf += conf_list[instance_idx - 1]
-            semantic_conf /= len(instance_indices)
-            semantic_conf_list.append(semantic_conf)
-        
-        del curr_que_pts
-        out_keys = list(out.keys())
-        for k in out_keys:
-            del out[k]
-        del out
-        
-        # match_pts_list, avg_conf_per_semantic
-        return {'match_pts_list': match_pts_list,
-                'semantic_conf_list': semantic_conf_list,
-                'instance_conf_list': conf_list}
-
-    def select_conf_pts(self,
-                        src_feat_info,
-                        avg_conf_per_semantic,
-                        database,
-                        output_dir):
-        avg_window = 5
-        full_pts_path = os.path.join(output_dir, 'full_pts')
-        # re-plot top K tracking points
-        topk_idx_list = []
-        topk = 5
-        for semantic_i, conf in enumerate(avg_conf_per_semantic):
-            src_pts = src_feat_info[self.curr_obs_torch['semantic_label'][semantic_i + 1]]['src_pts']
-            sorted_idx = np.argsort(conf)[::-1]
-            topk_idx = []
-            for idx in sorted_idx:
-                if len(topk_idx) == 0 or np.min(np.linalg.norm(src_pts[topk_idx] - src_pts[idx], axis=1)) > 0.05:
-                    topk_idx.append(idx)
-                if len(topk_idx) == topk:
-                    break
-            topk_idx_list.append(topk_idx)
-        topk_idx_list = np.stack(topk_idx_list, axis=0) # [semantic_num, topk]
-        
-        partial_vid_path = os.path.join(output_dir, 'partial_tracking.mp4')
-        partial_vid = cv2.VideoWriter(partial_vid_path, cv2.VideoWriter_fourcc(*'mp4v'), 2, (640 * 2, 360 * 2))
-        topk_match_pts_over_time = []
-        for sel_time in tqdm(database.get_times()[::5]):
-            match_pts_3d = np.load(os.path.join(full_pts_path, f'{sel_time:06d}.npy')) # [instance_num, rand_ptcl_num, 3]
-            topk_match_pts_list = []
-            for semantic_idx, semantic_label in enumerate(self.curr_obs_torch['semantic_label'][1:]):
-                instance_indices = find_indices(self.curr_obs_torch['mask_label'][0], semantic_label)
-                for instance_idx in instance_indices:
-                    topk_idx = topk_idx_list[semantic_idx]
-                    topk_match_pts = match_pts_3d[instance_idx - 1][topk_idx]
-                    topk_match_pts_list.append(topk_match_pts)
-                    
-            if sel_time < avg_window:
-                topk_match_pts_over_time.append(topk_match_pts_list)
-            else:
-                topk_match_pts_over_time.pop(0)
-                topk_match_pts_over_time.append(np.stack(topk_match_pts_list, axis=0)) # list of [instance_num, topk, 3]
-                topk_match_pts_over_time_np = np.stack(topk_match_pts_over_time, axis=0) # [avg_window, instance_num, topk, 3]
-                topk_match_pts_list = topk_match_pts_over_time_np.mean(axis=0) # [instance_num, topk, 3] 
-                    
-            merge_img = np.zeros((360 * 2, 640 * 2, 3), dtype=np.uint8)
-            for view_i in range(4):
-                h_idx = view_i // 2
-                w_idx = view_i % 2
-                merge_img[h_idx * 360:(h_idx + 1) * 360,
-                          w_idx * 640:(w_idx + 1) * 640] = \
-                              vis_tracking_multimodal_pts(database,
-                                                          topk_match_pts_list,
-                                                          None,
-                                                          sel_time,
-                                                          self.curr_obs_torch[f'mask'].detach().cpu().numpy(),
-                                                          view_idx=view_i)
-
-            cv2.imshow('merge_img', merge_img)
-            partial_vid.write(merge_img)
-            
-            key = cv2.waitKey(1)
-            if key == ord('q'):
-                cv2.destroyAllWindows()
-                break
-        partial_vid.release()
-    
-    def smooth_tracking(self,
-                        src_feat_info,
-                        last_match_pts_list,
-                        boundaries,
-                        rand_ptcl_num):
-        kernel_sigma = 0.05
-        lr = 0.001
-        iter_num = 100
-        reg_w = 1.0
-        dist_w = 0.01
-
-        src_feats = [src_feat_info[k]['src_feats'] for k in src_feat_info.keys()]
-        src_feats = torch.cat(src_feats, dim=0) # [num_instance * rand_ptcl_num, feat_dim]
-        
-        num_instance = len(last_match_pts_list)
-        last_match_pts_np = np.concatenate(last_match_pts_list, axis=0) # [num_instance * rand_ptcl_num, 3]
-        assert last_match_pts_np.shape[0] == num_instance * rand_ptcl_num
-        
-        last_match_pts_tensor = torch.from_numpy(last_match_pts_np).to(self.device, dtype=torch.float32)
-        W = torch.zeros((num_instance * rand_ptcl_num, 3)).to(self.device, dtype=torch.float32)
-        W.requires_grad_()
-        K = torch.zeros((num_instance * rand_ptcl_num, num_instance * rand_ptcl_num)).to(self.device, dtype=torch.float32)
-        for i in range(num_instance):
-            key = list(src_feat_info.keys())[i]
-            src_pts = src_feat_info[key]['src_pts'] # [rand_ptcl_num, 3]
-            src_pts = torch.from_numpy(src_pts).to(self.device, dtype=torch.float32)
-            self_dist = torch.norm(src_pts.unsqueeze(0) - src_pts.unsqueeze(1), dim=-1) # [rand_ptcl_num, rand_ptcl_num]
-            K[i * rand_ptcl_num:(i + 1) * rand_ptcl_num, i * rand_ptcl_num:(i + 1) * rand_ptcl_num] = \
-                torch.exp(-self_dist / kernel_sigma)
-        
-        optimizer = torch.optim.Adam([W], lr=lr, betas=(0.9, 0.999))
-        
-        loss_list = []
-        feat_loss_list = []
-        dist_loss_list = []
-        reg_loss_list = []
-        for iter_idx in range(iter_num):
-            curr_match_pts = K @ W + last_match_pts_tensor
-            out = self.eval(curr_match_pts, return_names=['dino_feats'])
-            curr_feats = out['dino_feats'] # [num_instance * rand_ptcl_num, feat_dim]
-            curr_dist = out['dist'] # [num_instance * rand_ptcl_num]
-            feat_loss = torch.norm(curr_feats - src_feats, dim=-1).mean()
-            dist_loss = dist_w * torch.clamp(curr_dist, min=0).mean()
-            reg_loss = reg_w * torch.norm(W)
-            loss = feat_loss + dist_loss + reg_loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            # record loss for debug
-            loss_list.append(loss.item())
-            feat_loss_list.append(feat_loss.item())
-            dist_loss_list.append(dist_loss.item())
-            reg_loss_list.append(reg_loss.item())
-            
-        # plt.plot(loss_list, label='loss')
-        # plt.plot(feat_loss_list, label='feat_loss')
-        # plt.plot(dist_loss_list, label='dist_loss')
-        # plt.plot(reg_loss_list, label='reg_loss')
-        # plt.legend()
-        # plt.show()
-        
-        match_pts_list = []
-        for i in range(num_instance):
-            match_pts_list.append(curr_match_pts[i * rand_ptcl_num:(i + 1) * rand_ptcl_num].detach().cpu().numpy())
-        
-        return {'match_pts_list': match_pts_list,}
     
     def rigid_tracking(self,
                        src_feat_info,
@@ -2838,9 +1683,98 @@ class Fusion():
             match_pts_list.append(curr_match_pts[i * rand_ptcl_num:(i + 1) * rand_ptcl_num].detach().cpu().numpy())
         
         return {'match_pts_list': match_pts_list,}
+
+    def vis_curr_mask(self):
+        # return vis_mask, which is a numpy array of shape [num_cam, H, W, 3]. It can be visualized using cv2
+        vis_mask = np.zeros((self.num_cam, self.H, self.W, 3))
+        for i in range(self.num_cam):
+            color = (self.curr_obs_torch['color'][i] * 255).astype(np.uint8)
+            mask = self.curr_obs_torch['mask'][i].detach().cpu().numpy() # [H, W, num_instance]
+            mask = onehot2instance(mask) # [H, W]
+            jet_cmap = cm.get_cmap('jet')
+            mask_colors = (jet_cmap(mask / mask.max())[..., :3] * 255).astype(np.uint8)
+            vis_mask[i] = (0.5 * color + 0.5 * mask_colors).astype(np.uint8)
+        return vis_mask.astype(np.uint8)
     
+    def clear_xmem_memory(self):
+        for xmem_proc in self.xmem_processors:
+            xmem_proc.clear_memory()
+        self.xmem_first_mask_loaded = False
+    
+    def close(self):
+        del self.curr_obs_torch
+        del self.ground_dino_model
+        del self.sam_model
+        del self.dinov2_feat_extractor
+        if self.feat_backbone != 'dinov2':
+            del self.feat_extractor
+        for xmem_proc in self.xmem_processors:
+            del xmem_proc
+
+def compare_dino_dinov2_time():
+    model_type = 'dinov2'
+    device = 'cuda'
+    fusion = Fusion(num_cam=4, feat_backbone=model_type, device=device, dtype=torch.float16)
+    for i in range(11):
+        if i == 1:
+            start_time = time.time()
+        img = (np.random.randn(4, 240, 320, 3) * 255).astype(np.uint8)
+        params = {
+            'patch_h': img.shape[1] // 10,
+            'patch_w': img.shape[2] // 10,
+        }
+        fusion.extract_features(img, params)
+    print(f'{model_type} time: {time.time() - start_time}')
+
+def compare_float_prec():
+    model_type = 'dinov2'
+    device = 'cuda'
+    fusion = Fusion(num_cam=4, feat_backbone=model_type, device=device, dtype=torch.float16)
+    img = (np.random.randn(4, 240, 320, 3) * 255).astype(np.uint8)
+    params = {
+        'patch_h': img.shape[1] // 10,
+        'patch_w': img.shape[2] // 10,
+    }
+    feats = fusion.extract_features(img, params)
+    
+    fusion_full = Fusion(num_cam=4, feat_backbone=model_type, device=device, dtype=torch.float32)
+    feats_full = fusion_full.extract_features(img, params)
+    
+    print('feat diff: ', torch.norm(feats - feats_full, dim=-1).mean())
+    print('feat diff max: ', torch.max(torch.abs(feats - feats_full)))
+
+
+def test_grounded_sam():
+    img = cv2.imread("/home/yixuan/bdai/general_dp/left_bottom_view_color_0.png")
+    queries = ["mug", "rack", "table"]
+    thresholds = [0.3]
+    device = 'cuda'
+    curr_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_file = os.path.join(curr_path, 'GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py')
+    grounded_checkpoint = os.path.join(curr_path, 'ckpts/groundingdino_swint_ogc.pth')
+    sam_checkpoint = os.path.join(curr_path, 'ckpts/sam_vit_h_4b8939.pth')
+    if not os.path.exists(grounded_checkpoint):
+        print('Downloading GroundedSAM model...')
+        ckpts_dir = os.path.join(curr_path, 'ckpts')
+        os.system(f'mkdir -p {ckpts_dir}')
+        # os.system('wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth')
+        # os.system(f'mv groundingdino_swinb_cogcoor.pth {ckpts_dir}')
+        os.system('wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth')
+        os.system(f'mv groundingdino_swint_ogc.pth {ckpts_dir}')
+    if not os.path.exists(sam_checkpoint):
+        print('Downloading SAM model...')
+        ckpts_dir = os.path.join(curr_path, 'ckpts')
+        os.system(f'mkdir -p {ckpts_dir}')
+        os.system('wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth')
+        os.system(f'mv sam_vit_h_4b8939.pth {ckpts_dir}')
+    ground_dino_model = GroundingDINOModel(config_file, grounded_checkpoint, device=device)
+    sam_model = SamPredictor(build_sam(checkpoint=sam_checkpoint))
+    sam_model.model = sam_model.model.to(device)
+    mask, label, mask_conf = grounded_instance_sam_new_ver(img, queries, ground_dino_model, sam_model, thresholds)
+    plt.imshow(mask[0])
+    plt.show()
+
 if __name__ == '__main__':
-    torch.cuda.set_device(0)
-    fusion = Fusion(num_cam=4, feat_backbone='dinov2')
-    
-    
+    # compare_dino_dinov2_time()
+    # compare_float_prec()
+    test_grounded_sam()
