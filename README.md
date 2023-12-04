@@ -89,8 +89,7 @@ camera_params.npy: (4,) numpy array, the camera parameters in the following orde
 Tips for debugging:
 - Make sure the transformation is right by visualizing `pcd` within `vis_repr_custom.py` using Open3D.
 - If the GPU is out of memory, run `vis_repr_custom.py` with smaller `step`. This will generate a more sparse voxel grid.
-- Make sure Grounded SAM outputs reasonable results by visualizing `mask` and `consensus_mask_label` attributes of `curr_obs_torch` within `fusion.py`.
-
+- Make sure Grounded SAM outputs reasonable results by checking `curr_obs_torch['mask']` and `curr_obs_torch['consensus_mask_label']` of `Fusion` class.
 
 ### Citation
 
