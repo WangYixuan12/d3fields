@@ -2,7 +2,7 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1xps4Ji_Xl8-riXF9cNYfkfmFiW-UWV0j?usp=sharing)
 
-### [Website](https://robopil.github.io/d3fields/) | [Paper](https://arxiv.org/abs/2309.16118/) | [Colab](https://colab.research.google.com/drive/1xps4Ji_Xl8-riXF9cNYfkfmFiW-UWV0j?usp=sharing)
+### [Website](https://robopil.github.io/d3fields/) | [Paper](https://arxiv.org/abs/2309.16118/) | [Colab](https://colab.research.google.com/drive/1xps4Ji_Xl8-riXF9cNYfkfmFiW-UWV0j?usp=sharing) | [Doc](doc/index.html)
 
 ***D<sup>3</sup>Fields: Dynamic 3D Descriptor Fields for Zero-Shot Generalizable Robotic Manipulation***
 
