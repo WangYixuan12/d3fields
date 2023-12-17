@@ -29,7 +29,6 @@ In this [notebook](https://colab.research.google.com/drive/1xps4Ji_Xl8-riXF9cNYf
 # create conda environment
 conda env create -f env.yaml
 conda activate d3fields
-pip install -e GroundingDINO/
 python scripts/install_pytorch3d.py
 
 # download pretrained models
