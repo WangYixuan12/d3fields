@@ -25,11 +25,11 @@ https://github.com/WangYixuan12/d3fields/assets/32333199/a3fced3d-e827-4e7e-ad6a
 In this [notebook](https://colab.research.google.com/drive/1xps4Ji_Xl8-riXF9cNYfkfmFiW-UWV0j?usp=sharing), we show how to build D<sup>3</sup>Fields and visualize reconstructed mesh, mask fields, and descriptor fields. We also demonstrate how to track keypoints of a video.
 
 ### Installation
+We recommend [Mambaforge](https://github.com/conda-forge/miniforge#mambaforge) instead of the standard anaconda distribution for faster installation:
 ```
 # create conda environment
-conda env create -f env.yaml
+mamba env create -f env.yaml
 conda activate d3fields
-python scripts/install_pytorch3d.py
 
 # download pretrained models
 bash scripts/download_ckpts.sh
