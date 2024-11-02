@@ -1,10 +1,10 @@
-# D<sup>3</sup>Fields: Dynamic 3D Descriptor Fields for Zero-Shot Generalizable Robotic Manipulation
+# D<sup>3</sup>Fields: Dynamic 3D Descriptor Fields for Zero-Shot Generalizable Rearrangement
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1xps4Ji_Xl8-riXF9cNYfkfmFiW-UWV0j?usp=sharing)
 
 ### [Website](https://robopil.github.io/d3fields/) | [Paper](https://arxiv.org/abs/2309.16118/) | [Colab](https://colab.research.google.com/drive/1xps4Ji_Xl8-riXF9cNYfkfmFiW-UWV0j?usp=sharing) | [Doc](https://robopil.github.io/d3fields/doc)
 
-***D<sup>3</sup>Fields: Dynamic 3D Descriptor Fields for Zero-Shot Generalizable Robotic Manipulation***
+***D<sup>3</sup>Fields: Dynamic 3D Descriptor Fields for Zero-Shot Generalizable Rearrangement***
 
 <a target="_blank" href="https://wangyixuan12.github.io/">Yixuan Wang</a><sup>1*</sup>,
 <a target="_blank" href="https://robopil.github.io/d3fields/">Zhuoran Li</a><sup>2, 3*</sup>,
